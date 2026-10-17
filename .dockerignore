@@ -1,0 +1,33 @@
+# docker/Dockerfile does `COPY . .`, so anything not listed here ends up in the
+# build context and then in the image.
+
+# Dependencies are installed inside the image (`npm ci`); the host copy may be
+# a different platform or architecture, and it is the largest thing in the tree.
+node_modules
+
+# Compiled output is rebuilt by `npm run build` in the image.
+dist
+*.tsbuildinfo
+
+# Git metadata: the build avoids the `prepare` hook's Git requirement instead of
+# shipping a repository, and the entrypoint creates its own snapshot in /opt/arl.
+.git
+
+# Runtime state, secrets and role projects. These live in the Compose bind
+# mounts and reach ~1 GB each per role, so shipping them would be both huge and
+# a credential leak (they contain Paseo state and authenticated agent homes).
+docker/worker
+docker/validator
+.aris
+.claude
+.agents
+.mcp.json
+
+# Local scratch and build leftovers.
+artifacts
+coverage
+project_validator
+distribution/releases
+.env
+.env.*
+*.log

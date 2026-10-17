@@ -12,3 +12,7 @@ coverage/
 __pycache__/
 .pytest_cache/
 .DS_Store
+.idea
+
+docker/worker
+docker/validator
