@@ -6,12 +6,12 @@
 | --- | --- |
 | [TASK_TEMPLATE.md](TASK_TEMPLATE.md) | Both roles. Becomes `task.md`, the only statement of the task. |
 | [ROLE_WORKER.md](ROLE_WORKER.md), [ROLE_VALIDATOR.md](ROLE_VALIDATOR.md) | Setup writes the matching one between the `ARIS ROLE` markers in `CLAUDE.md` (worker) or `AGENTS.md` (validator). |
-| [TESTER_FACILITY_CONFIG_TEMPLATE.json](TESTER_FACILITY_CONFIG_TEMPLATE.json) | Validator role. Starting point for the frozen benchmark. |
+| [TESTER_FACILITY_CONFIG_TEMPLATE.json](TESTER_FACILITY_CONFIG_TEMPLATE.json) | Validator role. Starting point for the benchmark's frozen base layer. |
 | [tester-benchmark/](tester-benchmark/) | Validator role. A worked lm-evaluation-harness deployment. |
 
 ## Benchmark runner protocol
 
-The frozen benchmark's `setup`, `healthcheck`, `smoke` and `test` entries are argv arrays with timeouts. Use `python` rather than `python3` so the same config runs on Windows. Runners receive:
+The base layer's `setup`, `healthcheck`, `smoke` and `test` entries are argv arrays with timeouts. Use `python` rather than `python3` so the same config runs on Windows. Runners receive:
 
 | Variable | Value |
 | --- | --- |
@@ -34,7 +34,8 @@ The frozen benchmark's `setup`, `healthcheck`, `smoke` and `test` entries are ar
 }
 ```
 
-- Sample ids are stable and unique; repeats get their own ids. A sample the deliverable failed on stays in the list with `status: "failed"`; the helper rejects runs that drop or fail samples, so a crash on one input must still produce a scored (zero) entry.
+- Each sample is one test. Sample ids are stable and unique; repeats get their own ids. A sample the deliverable crashed on stays in the list with `status: "failed"` and counts as a failed test; the helper rejects runs that drop samples.
 - `dataset.expected_samples` is the full protocol count including repeats, never the smoke count.
-- For `mean`/`sum` metrics every sample carries a finite score and the helper recomputes the aggregate. For `external` aggregation keep the native score file in `evidence_files`.
+- Every `ok` sample carries a finite value of the metric named by `validation.pass_rule`; the helper applies the rule to it. Aggregate `metrics` are kept for the record and not published.
 - Files listed in the config's `evidence_files` are hashed at setup. Changing one stops the validation service until setup runs again.
+- Layers that validator agents add later use the same output format (without `metrics` and `evidence_files`); see the `validation-review` skill.

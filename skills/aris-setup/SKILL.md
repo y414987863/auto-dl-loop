@@ -6,7 +6,7 @@ allowed-tools: Read, Write, Edit, Bash(*), AskUserQuestion
 
 # ARIS Setup
 
-ARIS runs one task on two machines. The **worker** builds a deliverable; the **validator** owns a frozen benchmark, scores each submission and decides when the task is done. The two talk only through the validation service's MCP tools. Each machine runs official Paseo, so the owner sees both sides' agents.
+ARIS runs one task on two machines. The **worker** builds a deliverable; the **validator** owns an append-only benchmark and tests each submission as the worker's adversary, adding tests derived from the problems it finds. The task ends when the counted submissions run out. The two talk only through the validation service's MCP tools. Each machine runs official Paseo, so the owner sees both sides' agents.
 
 The role is chosen at installation from the owner's prepared local Git checkout (`bash distribution/install-aris.sh --role worker|validator --project PATH`) and fixes the agent:
 
@@ -39,16 +39,16 @@ Show the whole sheet again after each refresh. A recommendation becomes a value 
 
 - `environment.secrets` (both roles): only the keys and tokens the environment scripts need, as `{"NAME": "value"}`; `{}` when there are none. Hosts, paths and commands belong in the environment skill (step 5).
 - `connection.url` and `connection.token` (worker): printed by `/aris-setup` on the validator machine.
-- `validation.benchmark`: the frozen benchmark. Build it with the owner from `.aris/templates/TESTER_FACILITY_CONFIG_TEMPLATE.json` and the runner protocol in `.aris/templates/README.md`; `.aris/templates/tester-benchmark/` is a worked lm-evaluation-harness example. Pin the benchmark source, dataset revision, split and full sample count. The runner must not import anything from a deliverable; it calls the deliverable only through the adapter a validator agent writes under `ARIS_ADAPTER_DIR`.
-- `validation.metric`: one benchmark metric and the target that ends the task.
-- `validation.leak_check.hidden_paths`: absolute paths of the hidden samples, labels and references. Feedback that quotes them is held back.
-- `validation.limits`: maximum counted submissions, concurrency, upload size and review timeout.
+- `validation.benchmark`: the base layer of the benchmark, frozen at setup; validator agents later add layers derived from its tests. Build it with the owner from `.aris/templates/TESTER_FACILITY_CONFIG_TEMPLATE.json` and the runner protocol in `.aris/templates/README.md`; `.aris/templates/tester-benchmark/` is a worked lm-evaluation-harness example. Pin the benchmark source, dataset revision, split and full sample count. The runner must not import anything from a deliverable; it calls the deliverable only through the adapter a validator agent writes under `ARIS_ADAPTER_DIR`.
+- `validation.pass_rule`: when one sample, which is one test, passes: a per-sample benchmark metric, an operator (`>=`, `>`, `<=`, `<`, `==`) and a threshold, e.g. `{"metric": "accuracy", "op": ">=", "threshold": 1}`. Results are published as tests passed out of tests run; there is no score or target.
+- `validation.hidden_paths`: absolute paths of the hidden samples, labels and references. The independent leak reviewer checks feedback against them and the added layers.
+- `validation.limits`: maximum counted submissions (the only stop condition), concurrency, upload size, review timeout, leak-review rewrites and the tests one review may add.
 - `validation.agent`: model and mode of the per-submission validator agent, which always runs Codex at `max`. The mode defaults to `full-access`, so the benchmark and the deliverable's documented install can use the network and paths outside the project; `auto` and `auto-review` sandbox them. On Windows `paseo_command` must be `["node", "<Paseo install>\\bin\\paseo"]`; setup rejects the `paseo` shim.
 - `validation.service`: how the worker reaches the service.
   - Through the Paseo service proxy: keep `host` at `127.0.0.1`, leave `port` null, and set `public_url` to the proxy URL of the `aris-validation` script.
   - Directly on a private network: set `host` to `0.0.0.0`, a fixed `port`, and `public_url` to `http://<this machine's address>:<port>`. On Windows, allow that port through the firewall: `netsh advfirewall firewall add rule name="ARIS validation" dir=in action=allow protocol=TCP localport=<port>`.
 
-Once a submission has been counted, the benchmark and metric are frozen and the helper reports any change as an issue. Changing them means a new validator project.
+Once a submission has been counted, the base benchmark and the pass rule are frozen and the helper reports any change as an issue. Changing them means a new validator project. A validator project set up before schema version 2 of `.aris/validation/config.json` is not migrated: without counted submissions it runs this setup again after deleting the old `validation.metric` and `validation.leak_check` entries from `.aris/setup-draft.json`; with counted submissions it needs a new validator project.
 
 ## 3. Confirm
 

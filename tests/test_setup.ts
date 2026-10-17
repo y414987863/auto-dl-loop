@@ -114,14 +114,14 @@ await project("validator", async (root) => {
   fs.writeFileSync(path.join(root, "AGENTS.md"), "Owner instructions.\n");
   const benchmark = facilityConfig(root);
   let review = refreshSetupReview(root, {
-    validation: { benchmark, metric: { name: "missing" } },
+    validation: { benchmark, pass_rule: { metric: "missing", threshold: 1 } },
   });
   assert.equal(review.role, "validator");
   assert.ok(review.issues.some((issue) => issue.field === "validation"));
   review = refreshSetupReview(root, {
     validation: {
-      metric: { name: "score", target: 1 },
-      leak_check: { hidden_paths: [path.join(root, "bench", "labels.json")] },
+      pass_rule: { metric: "score", op: ">=", threshold: 1 },
+      hidden_paths: [path.join(root, "bench", "labels.json")],
       agent: { provider: "claude", paseo_command: ["paseo"] },
       service: { host: "0.0.0.0", port: 70_000, public_url: "https://validation.example/" },
     },
@@ -155,7 +155,7 @@ await project("validator", async (root) => {
     fs.readFileSync(validationTokenPath(root), "utf8").trim(),
   );
   const config = readValidationConfig(root);
-  assert.deepEqual(config.metric, { name: "score", direction: "higher_better", target: 1 });
+  assert.deepEqual(config.pass_rule, { metric: "score", op: ">=", threshold: 1 });
   assert.deepEqual(config.agent, { provider: "codex", thinking: "max", mode: "full-access", paseo_command: PASEO });
   assert.equal(fs.readFileSync(path.join(root, ".gitignore"), "utf8"), ".aris/\n");
   assert.equal(config.limits.max_submissions, 20);
@@ -181,21 +181,21 @@ await project("validator", async (root) => {
 
   // Missing hidden data is reported.
   review = refreshSetupReview(root, {
-    validation: { leak_check: { hidden_paths: [path.join(root, "nowhere")] } },
+    validation: { hidden_paths: [path.join(root, "nowhere")] },
   });
-  assert.ok(review.issues.some((issue) => issue.field === "validation.leak_check.hidden_paths"));
+  assert.ok(review.issues.some((issue) => issue.field === "validation.hidden_paths"));
   review = refreshSetupReview(root, {
-    validation: { leak_check: { hidden_paths: [path.join(root, "bench", "labels.json")] } },
+    validation: { hidden_paths: [path.join(root, "bench", "labels.json")] },
   });
   assert.deepEqual(review.issues, []);
 
-  // Once a submission counts, the benchmark and metric are frozen; limits may still change.
+  // Once a submission counts, the base benchmark and pass rule are frozen; limits may still change.
   const { record } = createSubmission(root, config, undefined);
   withSubmissionsLock(root, () => updateSubmission(root, record.submission_id, { status: "queued" }));
-  review = refreshSetupReview(root, { validation: { metric: { target: 0.5 } } });
+  review = refreshSetupReview(root, { validation: { pass_rule: { threshold: 0.5 } } });
   assert.ok(review.issues.some((issue) => issue.message.includes("frozen")));
   review = refreshSetupReview(root, {
-    validation: { metric: { target: 1 }, limits: { max_submissions: 30 } },
+    validation: { pass_rule: { threshold: 1 }, limits: { max_submissions: 30 } },
   });
   assert.deepEqual(review.issues, []);
   confirmSetupReview(root, review.configuration_sha256);
@@ -247,7 +247,7 @@ await project("distribution", async (sandbox) => {
       fs.writeFileSync(patch, JSON.stringify({ environment: { secrets: { API_KEY: "k" } }, connection: { url: "https://validation.example/mcp", token: "k".repeat(43) } }));
     } else {
       const benchmark = facilityConfig(root);
-      fs.writeFileSync(patch, JSON.stringify({ validation: { benchmark, metric: { name: "score", target: 1 }, leak_check: { hidden_paths: [path.join(root, "bench/labels.json")] }, agent: { paseo_command: PASEO }, service: { public_url: "http://validation.example:8790", port: 8790 } } }));
+      fs.writeFileSync(patch, JSON.stringify({ validation: { benchmark, pass_rule: { metric: "score", op: ">=", threshold: 1 }, hidden_paths: [path.join(root, "bench/labels.json")], agent: { paseo_command: PASEO }, service: { public_url: "http://validation.example:8790", port: 8790 } } }));
     }
     const review = setup("review", "--input", patch);
     assert.deepEqual(review.issues, []);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,9 +16,21 @@ import {
   validationConfigPath,
   type ValidationConfig,
 } from "../src/tools/validation/config.js";
-import { paseoDispatcher, paseoRunArgv } from "../src/tools/validation/dispatch.js";
-import { checkLeak } from "../src/tools/validation/leak.js";
-import { finalizeSubmission, runBenchmark } from "../src/tools/validation/review.js";
+import {
+  leakReviewRun,
+  paseoDispatcher,
+  paseoRunArgv,
+  reviewRun,
+} from "../src/tools/validation/dispatch.js";
+import { benchmarkRepo, layerDir } from "../src/tools/validation/layers.js";
+import { requestLeakReview } from "../src/tools/validation/leak-review.js";
+import {
+  evaluate,
+  extendBenchmark,
+  finalizeSubmission,
+  retireBenchmarkLayer,
+  runSmoke,
+} from "../src/tools/validation/review.js";
 import { startValidationService } from "../src/tools/validation/server.js";
 import {
   readSubmission,
@@ -127,27 +140,8 @@ try {
     PERFECT,
   );
 
-  // --- leak check ---
-  const bench = path.join(root, "bench");
-  fs.mkdirSync(path.join(root, "hidden"));
-  const big = path.join(root, "hidden", "big.txt");
-  const boundary = 4 * 1024 * 1024;
-  // The secret straddles the 4 MiB read boundary.
-  fs.writeFileSync(big, `${"z".repeat(boundary - 16)} ;; Hidden passage spans two reads.`);
-  const hidden = [bench, path.join(root, "hidden")];
-  facilityConfig(root);
-  assert.equal(
-    checkLeak("Answers were often truncated mid sentence.", hidden, 12).leaked,
-    false,
-  );
-  const quoted = checkLeak("Expected: THE QUICK, brown-fox!", hidden, 12);
-  assert.equal(quoted.leaked, true);
-  assert.match(quoted.matches[0]!.excerpt, /quick brown/);
-  assert.equal(checkLeak("passage SPANS two reads", hidden, 12).leaked, true);
-  assert.equal(checkLeak("see sample-alpha", hidden, 40, ["sample-alpha"]).leaked, true);
-  assert.equal(checkLeak("see sample-alphabet", hidden, 40, ["sample-alpha"]).leaked, false);
-
   // --- dispatch ---
+  const bench = path.join(root, "bench");
   const fakePaseo = path.join(root, "fake-paseo.mjs");
   fs.writeFileSync(
     fakePaseo,
@@ -160,8 +154,8 @@ try {
     paseo_command: [process.execPath, fakePaseo],
   };
   const request = { root, submission_id: "s001", submission_dir: path.join(root, "s001") };
-  const argv = paseoRunArgv(agent, request);
-  for (const flag of ["run", "-d", "--json", "--model", "aris.submission=s001"])
+  const argv = paseoRunArgv(agent, reviewRun(request));
+  for (const flag of ["run", "-d", "--json", "--model", "aris.role=validator", "aris.submission=s001"])
     assert.ok(argv.includes(flag), flag);
   assert.deepEqual(argv.slice(argv.indexOf("--provider"), argv.indexOf("--provider") + 4), [
     "--provider",
@@ -169,6 +163,12 @@ try {
     "--thinking",
     "max",
   ]);
+  const leakArgv = paseoRunArgv(
+    agent,
+    leakReviewRun({ ...request, review_dir: path.join(root, "s001", "leak-review", "1") }),
+  );
+  assert.ok(leakArgv.includes("aris.role=leak-review"));
+  assert.match(leakArgv.at(-1)!, /leak-review\.md/);
   process.env.PASEO_AGENT_ID = "parent-agent";
   assert.deepEqual(await paseoDispatcher(agent)(request), { agent_id: "standalone" });
   delete process.env.PASEO_AGENT_ID;
@@ -176,8 +176,8 @@ try {
   // --- service ---
   await setupTesterFacility(root, facilityConfig(root));
   const config: ValidationConfig = {
-    schema_version: 1,
-    metric: { name: "score", direction: "higher_better", target: 1 },
+    schema_version: 2,
+    pass_rule: { metric: "score", op: ">=", threshold: 1 },
     tester_config_sha256: testerFacilityConfigSha256(
       readTesterFacilityConfig(testerConfigPath(root)),
     ),
@@ -191,8 +191,9 @@ try {
       upload_ttl_minutes: 60,
       review_timeout_minutes: 60,
       feedback_attempts: 1,
+      max_new_tests_per_review: 3,
     },
-    leak_check: { hidden_paths: [bench], min_match_chars: 12 },
+    hidden_paths: [bench],
     agent: { provider: "codex", thinking: "max", paseo_command: ["paseo"] },
     service: { host: "127.0.0.1", public_url: "https://validation.example" },
   };
@@ -210,6 +211,11 @@ try {
       return { agent_id: `agent-${submission_id}` };
     },
   });
+  const leakRuns: string[] = [];
+  const leakStarter = async (run: { title: string }) => {
+    leakRuns.push(run.title);
+    return { agent_id: `leak-${leakRuns.length}` };
+  };
   try {
     let rpcId = 0;
     const post = (body: unknown, auth = true) =>
@@ -232,8 +238,16 @@ try {
     const upload = (url: string, body: Buffer) =>
       fetch(url.replace(config.service.public_url, service.url), { method: "PUT", body });
     const status = (id: string) => readSubmission(root, id).status;
-    const write = (id: string, file: string, text: string) =>
-      fs.writeFileSync(path.join(submissionDir(root, id), file), text);
+    const write = (id: string, file: string, text: string) => {
+      const target = path.join(submissionDir(root, id), file);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, text);
+    };
+    /** Stands in for the independent leak reviewer of the latest request. */
+    const leakVerdict = (id: string, verdict: "pass" | "leak", findings: string[] = []) => {
+      const review = readSubmission(root, id).leak_reviews!.at(-1)!;
+      fs.writeFileSync(path.join(review.dir, "result.json"), JSON.stringify({ verdict, findings }));
+    };
 
     assert.equal((await post({ jsonrpc: "2.0", id: 0, method: "ping" }, false)).status, 401);
     assert.equal((await fetch(`${service.url}/mcp`, { headers: { authorization: `Bearer ${token}` } })).status, 405);
@@ -263,35 +277,93 @@ try {
     assert.equal(readSubmission(root, "s002").agent_id, "agent-s002");
     assert.equal((await upload(s2.upload_url, deliverable(PERFECT))).status, 404);
 
-    // The validator agent's side: smoke, full evaluation, verdict, feedback.
-    assert.equal((await runBenchmark(root, "s002", "smoke")).sample_count, 1);
-    assert.equal((await runBenchmark(root, "s002", "full")).metrics.score, 0.5);
+    // The validator agent's side: smoke, then every layer; one sample is one test.
+    assert.equal((await runSmoke(root, "s002")).sample_count, 1);
     write("s002", "review.json", JSON.stringify({ verdict: "valid", reasons: ["ran as documented"] }));
-    write("s002", "feedback.md", "One answer differs; expected The Quick Brown Fox.");
-    assert.throws(() => finalizeSubmission(root, "s002"), /FEEDBACK_LEAKS_HIDDEN_DATA/);
-    write("s002", "feedback.md", "Answer for sample-bravo is missing.");
-    // The single permitted rewrite still leaks a sample id: the result goes out without feedback.
+    assert.throws(() => finalizeSubmission(root, "s002"), /EVALUATION_REQUIRED/);
+    const base = await evaluate(root, "s002");
+    assert.deepEqual(base.runs.map((run) => [run.layer, run.tests]), [["base", { total: 2, passed: 1, failed: 1 }]]);
+
+    // New tests derive from tests this review has run and are drafted inside the submission directory.
+    const layerRunner = [
+      'import fs from "node:fs";',
+      'import path from "node:path";',
+      'const labels = JSON.parse(fs.readFileSync(new URL("./labels.json", import.meta.url), "utf8"));',
+      "let answers = {};",
+      'try { answers = JSON.parse(fs.readFileSync(path.join(process.env.ARIS_ARTIFACT_REF, "answers.json"), "utf8")); } catch {}',
+      'const samples = Object.keys(labels).map((id) => ({ id, status: "ok", metrics: { score: answers[id] === labels[id] ? 1 : 0 } }));',
+      "fs.writeFileSync(process.env.ARIS_TEST_OUTPUT, JSON.stringify({ artifact_sha256: process.env.ARIS_ARTIFACT_SHA256, samples }));",
+      // A runner may write into its own copy of the layer; the registered layer is untouched.
+      'fs.writeFileSync("cache.json", "{}");',
+    ].join("\n");
+    const draftLayer = (dir: string, tests: { id: string; derived_from: string[] }[]) => {
+      write("s002", `${dir}/runner.mjs`, layerRunner);
+      write("s002", `${dir}/labels.json`, JSON.stringify(Object.fromEntries(tests.map((test) => [test.id, "jumps over"]))));
+      write("s002", `${dir}/layer.json`, JSON.stringify({
+        problem: "multi-word answers cut short",
+        method: "rephrased variants of a failed question",
+        run: { argv: [process.execPath, "runner.mjs"], timeout_ms: 10_000 },
+        tests: tests.map((test) => ({ ...test, variation: "same question, reordered", reference_check: "label carried over from the parent" })),
+      }));
+      return path.join(submissionDir(root, "s002"), dir);
+    };
+    const variant = (id: string, from = "base:sample-bravo") => ({ id, derived_from: [from] });
+    assert.throws(() => extendBenchmark(root, "s002", draftLayer("draft-x", [variant("v1", "base:invented")])), /TEST_NOT_DERIVED/);
+    assert.throws(() => extendBenchmark(root, "s002", draftLayer("draft-y", ["v1", "v2", "v3", "v4"].map((id) => variant(id)))), /TEST_LIMIT/);
+    const outside = path.join(root, "outside-draft");
+    fs.cpSync(draftLayer("draft-z", [variant("v1")]), outside, { recursive: true });
+    assert.throws(() => extendBenchmark(root, "s002", outside), /INVALID_LAYER/);
+    const extended = extendBenchmark(root, "s002", draftLayer("draft-a", [variant("v1"), variant("v2")]));
+    assert.equal(extended.layer.id, "inc-001");
+    assert.equal(extended.layer.tests, 2);
+    assert.throws(() => finalizeSubmission(root, "s002"), /EVALUATION_REQUIRED: .*inc-001/);
+    const inc = await evaluate(root, "s002", "inc-001");
+    assert.deepEqual(inc.runs[0]!.tests, { total: 2, passed: 0, failed: 2 });
+    // Tests of the new layer can be parents too, but the per-review limit still holds.
+    assert.throws(
+      () => extendBenchmark(root, "s002", draftLayer("draft-b", [variant("w1", "inc-001:v1"), variant("w2", "inc-001:v2")])),
+      /TEST_LIMIT/,
+    );
+
+    // Feedback goes out only after an independent leak review of exactly this text.
+    write("s002", "feedback.md", "Answers keep only the first words of a longer expected answer.");
+    assert.throws(() => finalizeSubmission(root, "s002"), /LEAK_REVIEW_REQUIRED/);
+    await requestLeakReview(root, "s002", leakStarter);
+    assert.deepEqual(leakRuns, ["ARIS leak review s002"]);
+    assert.throws(() => finalizeSubmission(root, "s002"), /LEAK_REVIEW_PENDING/);
+    leakVerdict("s002", "leak", ["names the failing question's expected answer"]);
+    assert.throws(() => finalizeSubmission(root, "s002"), /FEEDBACK_LEAKS_HIDDEN_DATA.*1 attempts left/);
+    write("s002", "feedback.md", "Multi-word answers are cut short.");
+    assert.throws(() => finalizeSubmission(root, "s002"), /LEAK_REVIEW_REQUIRED/);
+    await requestLeakReview(root, "s002", leakStarter);
+    leakVerdict("s002", "leak", ["still describes one specific test"]);
+    // The single permitted rewrite still leaked: the result goes out without feedback.
+    await assert.rejects(requestLeakReview(root, "s002", leakStarter), /LEAK_REVIEWS_EXHAUSTED/);
     const published = finalizeSubmission(root, "s002");
-    assert.equal(published.score, 0.5);
+    assert.deepEqual(published.tests, { total: 4, passed: 1, failed: 3 });
     assert.equal(published.feedback_withheld, true);
     const q2 = await call("query", { submission_id: "s002" });
     const view = JSON.parse(q2.text);
     assert.equal(view.submission.verdict, "valid");
-    assert.equal(view.submission.score, 0.5);
+    assert.deepEqual(view.submission.tests, { total: 4, passed: 1, failed: 3 });
     assert.equal(view.submission.feedback, "");
     assert.equal(view.service.state, "open");
-    assert.ok(!q2.text.includes("sample-alpha"), "query never exposes per-sample data");
+    assert.equal(view.service.best, undefined);
+    for (const hidden of ["sample-alpha", "inc-001", "derived_from"])
+      assert.ok(!q2.text.includes(hidden), `query never exposes ${hidden}`);
 
-    // A cheating verdict voids the score even though the benchmark would give full marks.
+    // A cheating verdict voids every test; feedback that passed the leak review is published.
     const s3 = await submit();
     await upload(s3.upload_url, deliverable(PERFECT));
     await service.tick();
     write("s003", "review.json", JSON.stringify({ verdict: "cheating", reasons: ["answers are hard-coded"] }));
     write("s003", "feedback.md", "The deliverable returns stored answers instead of computing them.");
+    await requestLeakReview(root, "s003", leakStarter);
+    leakVerdict("s003", "pass");
     const cheated = finalizeSubmission(root, "s003");
     assert.equal(cheated.status, "rejected_cheating");
-    assert.equal(cheated.score, null);
-    assert.deepEqual(serviceSummary(root, config).best, { submission_id: "s002", score: 0.5 });
+    assert.equal(cheated.tests, null);
+    assert.match(JSON.parse((await call("query", { submission_id: "s003" })).text).submission.feedback, /stored answers/);
 
     // Live reservations hold slots; the limit refuses more until one expires.
     const s4 = await submit();
@@ -315,19 +387,51 @@ try {
     assert.equal(serviceSummary(root, config).counted, 2);
     const s7 = await submit();
 
-    // Meeting the frozen target completes validation and cancels what is left.
+    // A registered layer never changes: editing one stops validation until it is restored.
+    const repo = benchmarkRepo(root);
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", repo, "-c", "core.autocrlf=false", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" }).trim();
+    assert.deepEqual(git("log", "--format=%s").split(/\r?\n/), ["extend inc-001 (s002)", "benchmark: empty root"]);
+    assert.equal(fs.existsSync(path.join(layerDir(root, "inc-001"), "cache.json")), false);
+    const layerLabels = path.join(layerDir(root, "inc-001"), "labels.json");
+    const original = fs.readFileSync(layerLabels);
+    fs.appendFileSync(layerLabels, " ");
+    assert.match((await call("submit")).text, /BENCHMARK_CHANGED: registered benchmark files were edited/);
+    // Committing the edit is caught commit by commit, even with the head record moved along.
+    const head = git("rev-parse", "HEAD");
+    const headRecord = path.join(root, ".aris", "validation", "benchmark-head");
+    git("commit", "-q", "--no-verify", "-am", "edit a test");
+    assert.match((await call("submit")).text, /history was rewritten/);
+    fs.writeFileSync(headRecord, git("rev-parse", "HEAD"));
+    assert.match((await call("submit")).text, /modifies or deletes files/);
+    git("reset", "-q", "--hard", head);
+    fs.writeFileSync(headRecord, head);
+    // Dropping a layer by resetting the history no longer matches the recorded head.
+    git("reset", "-q", "--hard", "HEAD~1");
+    assert.match((await call("submit")).text, /history was rewritten/);
+    git("reset", "-q", "--hard", head);
+    assert.equal(fs.readFileSync(layerLabels, "utf8"), original.toString());
+
+    // Passing every test does not end validation; only the submission limit does.
     await upload(s4.upload_url, deliverable(PERFECT));
+    await upload(s7.upload_url, deliverable(PERFECT));
     await service.tick();
     assert.equal(status("s004"), "reviewing");
-    await runBenchmark(root, "s004", "full");
+    assert.equal(status("s007"), "queued");
+    // A wrong layer is retired, not edited; its tests stop counting.
+    assert.equal(retireBenchmarkLayer(root, "s004", "inc-001", "reference answers were wrong").retired?.by, "s004");
+    await evaluate(root, "s004");
     write("s004", "review.json", JSON.stringify({ verdict: "valid", reasons: ["clean"] }));
-    write("s004", "feedback.md", "");
-    assert.equal(finalizeSubmission(root, "s004").score, 1);
+    assert.deepEqual(finalizeSubmission(root, "s004").tests, { total: 2, passed: 2, failed: 0 });
+    assert.equal(serviceSummary(root, config).state, "open");
     await service.tick();
-    assert.equal(status(s7.submission_id), "cancelled");
+    assert.equal(status("s007"), "reviewing");
+    write("s007", "review.json", JSON.stringify({ verdict: "unusable", reasons: ["install fails"] }));
+    assert.equal(finalizeSubmission(root, "s007").tests, null);
     const done = JSON.parse((await call("query")).text);
-    assert.equal(done.service.state, "completed");
-    assert.match((await call("submit")).text, /VALIDATION_COMPLETED/);
+    assert.equal(done.service.state, "closed");
+    assert.equal(done.service.remaining, 0);
+    assert.match((await call("submit")).text, /SUBMISSION_LIMIT/);
     // A benchmark changed while the service runs refuses new submissions.
     const labels = fs.readFileSync(path.join(bench, "labels.json"));
     fs.appendFileSync(path.join(bench, "labels.json"), " ");
@@ -340,7 +444,7 @@ try {
   // A changed benchmark stops the service.
   fs.appendFileSync(path.join(bench, "labels.json"), " ");
   await assert.rejects(startValidationService(root, { port: 0 }), /BENCHMARK_CHANGED|TESTER_EVIDENCE_CHANGED/);
-  console.log("validation: unzip, leak check, dispatch, service, review and stop rules passed");
+  console.log("validation: unzip, dispatch, layers, leak review, service and stop rules passed");
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

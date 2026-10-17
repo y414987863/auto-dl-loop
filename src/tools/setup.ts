@@ -18,14 +18,15 @@ import {
 import { failA1, isRecord, type JsonObject } from "./validate.js";
 import {
   DEFAULT_LIMITS,
+  PASS_OPERATORS,
   VALIDATOR_MODES,
-  assertFrozenBenchmark,
   readValidationConfig,
   ensureValidationToken,
   validateValidationConfig,
   validationConfigPath,
   type ValidationConfig,
 } from "./validation/config.js";
+import { assertBenchmarkIntact } from "./validation/layers.js";
 import { countedSubmissions } from "./validation/store.js";
 import {
   ROLE_AGENT,
@@ -86,11 +87,11 @@ const MODULE_FIELDS: Record<string, readonly string[]> = {
   environment: ["secrets"],
   connection: ["url", "token"],
   validation: [
-    "metric",
+    "pass_rule",
     "benchmark",
     "adapter_contract",
     "limits",
-    "leak_check",
+    "hidden_paths",
     "agent",
     "service",
   ],
@@ -98,6 +99,7 @@ const MODULE_FIELDS: Record<string, readonly string[]> = {
 const CHOICES: Record<string, readonly unknown[]> = {
   "project.language": ["zh", "en"],
   "validation.agent.mode": VALIDATOR_MODES,
+  "validation.pass_rule.op": PASS_OPERATORS,
   "validation.benchmark.metrics.*.direction": ["higher_better", "lower_better"],
   "validation.benchmark.metrics.*.aggregation": ["mean", "sum", "external"],
   "validation.service.host": ["127.0.0.1", "0.0.0.0"],
@@ -180,11 +182,11 @@ function moduleDefaults(root: string, module: string): JsonObject {
     ? readJson(installed)
     : readJson(path.join(TEMPLATES, "TESTER_FACILITY_CONFIG_TEMPLATE.json"));
   return {
-    metric: { name: null, target: null },
+    pass_rule: { metric: null, op: ">=", threshold: null },
     benchmark,
     adapter_contract: ADAPTER_CONTRACT,
     limits: DEFAULT_LIMITS,
-    leak_check: { hidden_paths: [], min_match_chars: 40 },
+    hidden_paths: [],
     agent: { model: null, mode: "full-access", paseo_command: ["paseo"] },
     service: { host: "127.0.0.1", port: null, public_url: null },
   };
@@ -218,13 +220,16 @@ function recommendation(key: string, value: unknown): string {
     "connection.url": "The `url` printed by `/aris-setup` on the validator machine.",
     "connection.token":
       "The `token` printed by `/aris-setup`; the provider MCP config will hold it, so keep that file out of git.",
-    "validation.metric.name": "One of the benchmark's metric names.",
-    "validation.metric.target":
-      "The value that ends the task, in the metric's unit; the benchmark metric decides the direction.",
+    "validation.pass_rule.metric":
+      "The benchmark metric each sample reports; one sample is one test, passed or failed by this rule.",
+    "validation.pass_rule.op":
+      "How a sample's value compares with the threshold for the test to pass.",
+    "validation.pass_rule.threshold":
+      "The per-sample value a test must reach, e.g. 1 for an exact-match score of 0 or 1.",
     "validation.adapter_contract":
       "Exactly how your runner calls ARIS_ADAPTER_DIR; a validator agent writes each submission's adapter to this contract.",
-    "validation.leak_check.hidden_paths":
-      "Absolute paths of the hidden samples, labels and references; feedback quoting them is held back.",
+    "validation.hidden_paths":
+      "Absolute paths of the hidden samples, labels and references; the leak reviewer checks feedback against them.",
     "validation.agent.mode":
       "full-access lets the benchmark and the deliverable's install use the network and paths outside the project; sandboxed modes make those steps fail or wait for approval.",
     "validation.agent.paseo_command":
@@ -274,26 +279,20 @@ function draftValidationConfig(
   validation: JsonObject,
   benchmark: TesterFacilityConfig,
 ): ValidationConfig {
-  const metricName = get(validation, "metric.name");
-  const declared = benchmark.metrics.find((metric) => metric.name === metricName);
-  if (!declared)
+  const metricName = get(validation, "pass_rule.metric");
+  if (!benchmark.metrics.some((metric) => metric.name === metricName))
     failA1(
       "INVALID_VALUE",
       `choose one of ${JSON.stringify(benchmark.metrics.map((metric) => metric.name))}`,
-      "validation.metric.name",
+      "validation.pass_rule.metric",
     );
-  const { metric: _metric, benchmark: _benchmark, ...rest } = validation;
+  const { benchmark: _benchmark, ...rest } = validation;
   // The port belongs to the paseo.json service entry; Paseo hands it to the service as PASEO_PORT.
   const { port: _port, ...service } = isRecord(validation.service) ? validation.service : {};
   return validateValidationConfig({
     ...rest,
     service,
-    schema_version: 1,
-    metric: {
-      name: declared.name,
-      direction: declared.direction,
-      target: get(validation, "metric.target"),
-    },
+    schema_version: 2,
     tester_config_sha256: testerFacilityConfigSha256(benchmark),
   });
 }
@@ -383,19 +382,18 @@ export function validateSetupConfiguration(configuration: JsonObject, root: stri
     if (benchmark)
       attempt("validation", () => {
         const next = draftValidationConfig(validation, benchmark!);
-        for (const hidden of next.leak_check.hidden_paths)
-          if (!fs.existsSync(hidden))
-            add("validation.leak_check.hidden_paths", `${hidden} is missing`);
+        for (const hidden of next.hidden_paths)
+          if (!fs.existsSync(hidden)) add("validation.hidden_paths", `${hidden} is missing`);
         const frozenFile = validationConfigPath(root);
         if (fs.existsSync(frozenFile) && countedSubmissions(root) > 0) {
           const frozen = validateValidationConfig(readStateFile(frozenFile));
           if (
             frozen.tester_config_sha256 !== next.tester_config_sha256 ||
-            canonicalJsonSha256(frozen.metric) !== canonicalJsonSha256(next.metric)
+            canonicalJsonSha256(frozen.pass_rule) !== canonicalJsonSha256(next.pass_rule)
           )
             add(
               "validation",
-              "submissions were already scored against the frozen benchmark and metric; start a new validator project to change them",
+              "submissions were already tested against the frozen base benchmark and pass rule; start a new validator project to change them",
             );
         }
       });
@@ -617,7 +615,7 @@ export async function applySetup(projectRoot: string): Promise<SetupApplyResult>
     return { role, mcp_config: file, ...environment };
   }
   const validation = configuration.validation as JsonObject;
-  if (countedSubmissions(root) > 0) assertFrozenBenchmark(root, readValidationConfig(root));
+  if (countedSubmissions(root) > 0) assertBenchmarkIntact(root, readValidationConfig(root));
   const benchmark = await setupTesterFacility(root, validation.benchmark);
   const config = draftValidationConfig(validation, benchmark);
   writeStateJsonAtomic(validationConfigPath(root), config);

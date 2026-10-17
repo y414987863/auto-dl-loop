@@ -4,9 +4,9 @@
 
 [中文](README.zh-CN.md) · [Quick start](#quick-start) · [Setup guide](SETUP_GUIDE.md) · [Architecture](ARIS_ARCHITECTURE_GUIDE.md)
 
-Give an agent a task, a measurable target and a submission budget. Auto Research Loop (ARL) lets a Claude Code worker develop a solution, submit it for independent evaluation by Codex validator agents and improve it using measured scores and reviewed feedback.
+Give an agent a task, a benchmark and a submission budget. Auto Research Loop (ARL) lets a Claude Code worker develop a solution, submit it for independent, adversarial testing by Codex validator agents and improve it using measured test results and leak-reviewed feedback.
 
-ARL is designed for benchmark-driven coding, model evaluation and experimental research. The worker chooses how to plan and implement the task. A separate validator machine owns the hidden benchmark and evaluates each submission against the same frozen criteria.
+ARL is designed for benchmark-driven coding, model evaluation and experimental research. The worker chooses how to plan and implement the task. A separate validator machine owns the hidden, append-only benchmark and tests each submission with a pass rule frozen at setup.
 
 Use the official **Paseo** app and CLI to run and monitor agents on both machines. ARL installs its own skills and helpers into your projects as a standalone package.
 
@@ -15,11 +15,11 @@ Use the official **Paseo** app and CLI to run and monitor agents on both machine
 ### Independent, measured validation
 
 - **Two machines, two projects.** The worker builds the deliverable; the validator machine owns the hidden benchmark. They interact only through the `submit` and `query` MCP tools, with no shared directory.
-- **Frozen benchmark.** Benchmark code, data revision, split, sample count, evaluation settings and target are pinned at setup. Once a submission is counted, any change stops the service.
-- **Measured scores.** Scores come from complete per-sample benchmark results, checked for sample counts and aggregate consistency. The worker never reports its own score.
-- **Submission review.** A validator agent inspects each artifact, writes its own adapter from `USAGE.md`, runs the benchmark and judges it `valid`, `cheating` or `unusable`. Only valid submissions keep their score.
-- **Leak-checked feedback.** Feedback describes problem types with invented examples. Text that matches hidden samples, labels or paths is held back for rewriting before publication.
-- **Defined stopping.** The task completes when a valid score reaches the target, or closes when the submission budget is used up. Upload and infrastructure failures do not count against the budget.
+- **Append-only benchmark.** The base benchmark's code, data revision, split, sample count, evaluation settings and per-sample pass rule are pinned at setup. Validator agents add layers of tests (`inc-001`, …), each test derived from existing tests, never invented from nothing. Added layers live in a git repository the helper alone commits to, and every commit may only add files, which the helper checks commit by commit; a wrong layer is retired, not edited. Any change to a pinned file or to that history stops the service.
+- **Measured test results.** Each benchmark sample is one test, passed or failed by the frozen pass rule (`metric`, `op`, `threshold`) applied to complete per-sample runner output. Results report how many tests passed out of how many; there is no score, and results of different submissions are not compared. The worker never reports its own results.
+- **Adversarial review.** A validator agent inspects each artifact, writes its own adapter from `USAGE.md`, reruns every benchmark layer and hunts for as many real problems within `task.md` as it can, using any tool or researched testing method. It judges the submission `valid`, `cheating` or `unusable`; a cheating verdict voids every test result.
+- **Leak-reviewed feedback.** Feedback states the real problems: what goes wrong, which requirement of `task.md` it breaks, roughly how often, how severe, and which earlier problems were solved or persist. It never reveals the tests. A separate, independent agent checks it against the hidden tests before publication; if it still leaks after the allowed rewrites, only the verdict and test counts are published.
+- **Defined stopping.** The task closes only when the counted submissions are used up; passing every current test does not end it. Upload, format and infrastructure failures do not count against the budget.
 
 ### Fixed agents per role
 
@@ -28,11 +28,11 @@ Use the official **Paseo** app and CLI to run and monitor agents on both machine
 | worker | Claude Code | `ultracode` | `CLAUDE.md` |
 | validator  | Codex | `max` | `AGENTS.md` |
 
-The installer's `--role` fixes the agent, its skills directory and configuration. The validation service starts every review agent as Codex at `max`.
+The installer's `--role` fixes the agent, its skills directory and configuration. Every review agent the validation service starts, and every feedback leak-review agent, runs as Codex at `max`.
 
 ### Strict iteration with memory
 
-- **Numbered iteration flow.** The worker's role instructions require every step in order: read memory → choose problems and an untried idea → plan in the todo list → run experiments → commit → submit → record the scored result → save lessons. Each submission maps to exactly one Git commit.
+- **Numbered iteration flow.** The worker's role instructions require every step in order: read memory → choose problems and an untried idea → plan in the todo list → run experiments → commit → submit → record the verdict and test counts → save lessons. Each submission maps to exactly one Git commit.
 - **Long-term memory is mandatory.** The `research-wiki` records, for one or more problems, what existing work did (surveys from arXiv, Semantic Scholar, OpenAlex, Exa and others), which ideas and experiments were tried, and which were effective or ineffective. Typed evidence edges link them (`supports`, `invalidates`, `solves`, `reproduces`, …).
 - **Compact query pack.** Each iteration starts from a deterministic summary of at most 1000 characters, with one line per open problem marking effective (✔) and ineffective (✘) attempts by node id. Details stay in the node pages.
 - **Validation memory.** The validator machine keeps its own wiki of verification problems, recording which ones each submission solved and which persist. Reviews check them again and report both.
@@ -55,11 +55,11 @@ The installer copies compiled helpers, four core skills (`aris-setup`, `validati
 
 ## How it works
 
-1. **Define the task.** Put the same `task.md` on both machines. Configure the validation benchmark, target and submission budget, then review and freeze the configuration.
+1. **Define the task.** Put the same `task.md` on both machines. Configure the validation benchmark, per-sample pass rule and submission budget, then review and freeze the configuration.
 2. **Build a solution.** The worker plans, codes and experiments in its own environment, without access to the validator machine's hidden data.
 3. **Submit an artifact.** The worker commits the solution to Git, calls `submit`, receives a temporary single-use upload URL and uploads a zip containing the solution and `USAGE.md`.
-4. **Evaluate independently.** The service starts a validator agent through official Paseo. The agent reviews the artifact, runs the frozen benchmark and prepares feedback for publication.
-5. **Improve or finish.** The worker calls `query` for status, score and published feedback. It turns the feedback into todo items, fixes them and continues until the task reaches `completed` or `closed`.
+4. **Evaluate independently.** The service starts a validator agent through official Paseo. The agent reviews the artifact, reruns every benchmark layer, adds derived tests where it finds more problems and writes feedback, which an independent leak-review agent checks before publication.
+5. **Improve or finish.** The worker calls `query` for status, verdict, test counts and published feedback. It turns the feedback into todo items, fixes them and continues until the task reaches `closed` (no submissions left).
 
 Keep the two projects on separate machines without a shared or synchronized directory. That separation keeps the hidden benchmark outside the worker's environment. See the [architecture guide](ARIS_ARCHITECTURE_GUIDE.md) for evaluation and feedback boundaries.
 
@@ -119,7 +119,7 @@ The standalone package ships four core skills:
 | Skill | Purpose |
 | --- | --- |
 | [`aris-setup`](skills/aris-setup/SKILL.md) | Configure and confirm the installed role, then write and verify the project environment skill. |
-| [`validation-review`](skills/validation-review/SKILL.md) | Review a submission and produce benchmark-backed results. |
+| [`validation-review`](skills/validation-review/SKILL.md) | Review a submission as the worker's adversary: rerun and extend the benchmark, then publish a verdict, test counts and leak-reviewed feedback. |
 | [`research-wiki`](skills/research-wiki/SKILL.md) | Maintain and query the role's long-term memory. |
 | [`browser-act`](skills/browser-act/SKILL.md) | Access rendered pages and browser sessions through the external browser-act CLI. |
 
@@ -132,7 +132,7 @@ The `.aris/` project directory remains stable. Optional literature, GPU platform
 | Guide | Use it for |
 | --- | --- |
 | [Setup guide](SETUP_GUIDE.md) / [中文部署指南](SETUP_GUIDE_CN.md) | Deploying the two machines and operating your installation. |
-| [Architecture](ARIS_ARCHITECTURE_GUIDE.md) | Understanding task state, benchmark integrity, scoring and validation boundaries. |
+| [Architecture](ARIS_ARCHITECTURE_GUIDE.md) | Understanding task state, benchmark integrity, pass rules and validation boundaries. |
 | [Agent guide](AGENT_GUIDE.md) | Choosing skills and finding project records. |
 | [Contributing](CONTRIBUTING.md) | Developing ARL and running focused checks. |
 | [Packaging](docs/arl-install.md) | Building the archive and understanding installation ownership. |

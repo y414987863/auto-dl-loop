@@ -231,8 +231,9 @@ function killTree(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
     else process.kill(-pid, signal);
   } catch {}
 }
-async function execute(
-  config: TesterFacilityConfig,
+/** Run one command in `execution.cwd`, appending its output to `logPath`; any failure throws. */
+export async function execute(
+  execution: TesterFacilityConfig["execution"],
   cmd: TesterCommand,
   env: Record<string, string>,
   logPath: string,
@@ -243,8 +244,8 @@ async function execute(
   try {
     await new Promise<void>((resolve, reject) => {
       const child = spawn(executable, argv, {
-        cwd: config.execution.cwd,
-        env: { ...process.env, ...config.execution.env, ...env },
+        cwd: execution.cwd,
+        env: { ...process.env, ...execution.env, ...env },
         stdio: ["ignore", log, log],
         // A detached POSIX child leads its own process group, so killTree reaches its children.
         detached: process.platform !== "win32",
@@ -328,9 +329,9 @@ async function setupTesterFacilityUnlocked(
     } catch {}
   }
   fs.rmSync(`${file}.setup.json`, { force: true });
-  for (const cmd of config.setup) await execute(config, cmd, {}, log);
-  await execute(config, config.healthcheck, {}, log);
-  await execute(config, config.smoke, { ARIS_TEST_MODE: "smoke" }, log);
+  for (const cmd of config.setup) await execute(config.execution, cmd, {}, log);
+  await execute(config.execution, config.healthcheck, {}, log);
+  await execute(config.execution, config.smoke, { ARIS_TEST_MODE: "smoke" }, log);
   const evidence = config.evidence_files.map((source) =>
     evidenceFile(path.resolve(config.execution.cwd, source)),
   );
@@ -484,9 +485,9 @@ export async function executeTesterJob(dir: string): Promise<TesterTestResult> {
         ? {}
         : { ARIS_ADAPTER_DIR: job.request.adapter_dir }),
     };
-    await execute(job.config, job.config.healthcheck, env, log);
+    await execute(job.config.execution, job.config.healthcheck, env, log);
     await execute(
-      job.config,
+      job.config.execution,
       job.request.mode === "full" ? job.config.test : job.config.smoke,
       env,
       log,
@@ -548,15 +549,19 @@ export async function executeTesterJob(dir: string): Promise<TesterTestResult> {
   }
 }
 /**
- * Recompute what a full result claims from its raw evidence: complete coverage, no failed
- * samples, unchanged benchmark files and aggregates that match the per-sample scores.
+ * Re-check a completed full run against its raw evidence: the binding to request and setup,
+ * unchanged benchmark files, and every expected sample present once with an explicit status.
+ * A failed sample is a test the artifact failed, not a broken run; the caller counts it.
  */
-export function checkTesterResult(resultPath: string): TesterTestResult {
+export function checkTesterResult(resultPath: string): {
+  result: TesterTestResult;
+  samples: Record<string, unknown>[];
+} {
   const result = readStateFile<TesterTestResult>(resultPath);
   const request = validateTesterTestRequest(result.request),
     config = validateTesterFacilityConfig(result.config);
   if (result.status !== "completed" || request.mode !== "full")
-    failA1("TESTER_FULL_RESULT_REQUIRED", "only completed full benchmark results are scored");
+    failA1("TESTER_FULL_RESULT_REQUIRED", "only completed full benchmark results count");
   if (
     result.test_id !== request.test_id ||
     result.request_sha256 !== canonicalJsonSha256(request) ||
@@ -568,56 +573,26 @@ export function checkTesterResult(resultPath: string): TesterTestResult {
   if (raw.artifact_sha256 !== request.artifact.sha256)
     failA1("TESTER_RESULT_BINDING_MISMATCH", "raw results identify a different artifact");
   if (
-    !isRecord(raw.metrics) ||
     !Array.isArray(raw.samples) ||
     raw.samples.length !== config.dataset.expected_samples ||
-    result.sample_count !== raw.samples.length ||
-    result.failed_samples !== 0
+    result.sample_count !== raw.samples.length
   )
-    failA1(
-      "TESTER_COVERAGE_INCOMPLETE",
-      "full expected sample coverage with no unresolved failures is required",
-    );
-  if (
-    canonicalJsonSha256(raw.metrics) !== canonicalJsonSha256(result.metrics) ||
-    Object.keys(result.metrics).sort().join() !==
-      config.metrics
-        .map((m) => m.name)
-        .sort()
-        .join()
-  )
-    failA1("TESTER_METRIC_MISMATCH", "metrics differ from raw evidence or setup");
+    failA1("TESTER_COVERAGE_INCOMPLETE", "every expected sample must be in the result");
   const ids = new Set<string>();
+  let failed = 0;
   for (const sample of raw.samples) {
     if (
       !isRecord(sample) ||
       typeof sample.id !== "string" ||
       !sample.id ||
       ids.has(sample.id) ||
-      sample.status !== "ok"
+      !["ok", "failed"].includes(String(sample.status))
     )
-      failA1("TESTER_COVERAGE_INCOMPLETE", "invalid, duplicated or failed sample");
+      failA1("TESTER_COVERAGE_INCOMPLETE", "invalid or duplicated sample");
     ids.add(sample.id);
+    if (sample.status === "failed") failed++;
   }
-  for (const metric of config.metrics) {
-    const value = result.metrics[metric.name];
-    if (typeof value !== "number" || !Number.isFinite(value))
-      failA1("TESTER_METRIC_MISMATCH", "non-finite metric");
-    if (metric.aggregation === "external") continue; // The reviewing agent checks benchmark-specific aggregators.
-    const scores = raw.samples.map((s: unknown) => {
-      if (
-        !isRecord(s) ||
-        !isRecord(s.metrics) ||
-        typeof s.metrics[metric.name] !== "number" ||
-        !Number.isFinite(s.metrics[metric.name])
-      )
-        failA1("TESTER_SCORE_MISSING", metric.name);
-      return s.metrics[metric.name] as number;
-    });
-    const sum = scores.reduce((a, b) => a + b, 0),
-      expected = metric.aggregation === "mean" ? sum / scores.length : sum;
-    if (Math.abs(expected - value) > 1e-9 * Math.max(1, Math.abs(expected)))
-      failA1("TESTER_AGGREGATION_MISMATCH", metric.name);
-  }
-  return result;
+  if (failed !== result.failed_samples)
+    failA1("TESTER_RESULT_BINDING_MISMATCH", "failed sample count differs from raw evidence");
+  return { result, samples: raw.samples as Record<string, unknown>[] };
 }

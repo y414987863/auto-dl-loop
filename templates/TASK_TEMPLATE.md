@@ -1,6 +1,6 @@
 # Task
 
-<!-- Both machines read this file. Describe what to build, not how it is scored in detail:
+<!-- Both machines read this file. Describe what to build, not how it is tested in detail:
      the validator machine keeps the benchmark and its data hidden. -->
 
 ## Goal

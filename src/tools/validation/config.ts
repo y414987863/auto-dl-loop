@@ -1,15 +1,9 @@
-/** The validator machine's frozen terms: what is measured, how often, and by whom. */
+/** The validator machine's terms: how a test passes, how often, and by whom. */
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ROLE_AGENT } from "../provider.js";
 import { readStateFile, writeStateFileAtomic } from "../state-file.js";
-import {
-  assertTesterSetupReady,
-  readTesterFacilityConfig,
-  testerConfigPath,
-  testerFacilityConfigSha256,
-} from "../tester-facility.js";
 import {
   assertNoUnknownFields,
   failA1,
@@ -19,7 +13,15 @@ import {
   requireString,
 } from "../validate.js";
 
-export type MetricDirection = "higher_better" | "lower_better";
+export type PassOperator = ">=" | ">" | "<=" | "<" | "==";
+export const PASS_OPERATORS: readonly PassOperator[] = [">=", ">", "<=", "<", "=="];
+
+/** One test passes when its per-sample value of `metric` satisfies `op threshold`. */
+export interface PassRule {
+  metric: string;
+  op: PassOperator;
+  threshold: number;
+}
 
 export interface ValidationLimits {
   /** Counted submissions; format failures and infrastructure failures do not count. */
@@ -30,8 +32,10 @@ export interface ValidationLimits {
   max_files: number;
   upload_ttl_minutes: number;
   review_timeout_minutes: number;
-  /** Rewrites a validator agent gets when its feedback trips the leak check. */
+  /** Rewrites a validator agent gets when the leak review finds a leak in its feedback. */
   feedback_attempts: number;
+  /** Tests one review may add across the layers it registers. */
+  max_new_tests_per_review: number;
 }
 
 export interface ValidationAgentConfig {
@@ -48,14 +52,15 @@ export interface ValidationAgentConfig {
 }
 
 export interface ValidationConfig {
-  schema_version: 1;
-  metric: { name: string; direction: MetricDirection; target: number };
-  /** The benchmark frozen at setup; a different installed config stops the service. */
+  schema_version: 2;
+  pass_rule: PassRule;
+  /** The base layer frozen at setup; a different installed config stops the service. */
   tester_config_sha256: string;
   /** What a validator agent must write into a submission's adapter directory. */
   adapter_contract: string;
   limits: ValidationLimits;
-  leak_check: { hidden_paths: string[]; min_match_chars: number };
+  /** Hidden samples, labels and references of the base layer, for the leak reviewer. */
+  hidden_paths: string[];
   agent: ValidationAgentConfig;
   service: { host: string; public_url: string };
 }
@@ -76,6 +81,7 @@ export const DEFAULT_LIMITS: ValidationLimits = {
   upload_ttl_minutes: 60,
   review_timeout_minutes: 24 * 60,
   feedback_attempts: 3,
+  max_new_tests_per_review: 200,
 };
 
 export const validationDir = (root: string): string =>
@@ -91,28 +97,28 @@ function strings(value: unknown, location: string): string[] {
 }
 
 export function validateValidationConfig(value: unknown): ValidationConfig {
-  if (!isRecord(value) || value.schema_version !== 1)
+  if (!isRecord(value) || value.schema_version !== 2)
     failA1("INVALID_VALIDATION_CONFIG", "run /aris-setup validation to create it");
   assertNoUnknownFields(
     value,
     [
       "schema_version",
-      "metric",
+      "pass_rule",
       "tester_config_sha256",
       "adapter_contract",
       "limits",
-      "leak_check",
+      "hidden_paths",
       "agent",
       "service",
     ],
     "validation",
   );
-  for (const key of ["metric", "limits", "leak_check", "agent", "service"])
+  for (const key of ["pass_rule", "limits", "agent", "service"])
     if (!isRecord(value[key])) failA1("INVALID_VALIDATION_CONFIG", `${key} must be an object`);
-  const metric = value.metric as Record<string, unknown>;
-  assertNoUnknownFields(metric, ["name", "direction", "target"], "metric");
-  if (metric.direction !== "higher_better" && metric.direction !== "lower_better")
-    failA1("INVALID_VALUE", "choose higher_better or lower_better", "metric.direction");
+  const rule = value.pass_rule as Record<string, unknown>;
+  assertNoUnknownFields(rule, ["metric", "op", "threshold"], "pass_rule");
+  if (!PASS_OPERATORS.includes(rule.op as PassOperator))
+    failA1("INVALID_VALUE", `choose one of ${PASS_OPERATORS.join(" ")}`, "pass_rule.op");
   const rawLimits = value.limits as Record<string, unknown>;
   assertNoUnknownFields(rawLimits, Object.keys(DEFAULT_LIMITS), "limits");
   const limits = { ...DEFAULT_LIMITS };
@@ -123,14 +129,11 @@ export function validateValidationConfig(value: unknown): ValidationConfig {
         `limits.${key}`,
         key === "feedback_attempts" ? 0 : 1,
       );
-  const leak = value.leak_check as Record<string, unknown>;
-  assertNoUnknownFields(leak, ["hidden_paths", "min_match_chars"], "leak_check");
-  const hidden = strings(leak.hidden_paths, "leak_check.hidden_paths");
-  if (!hidden.length)
-    failA1("INVALID_VALUE", "name the hidden benchmark files", "leak_check.hidden_paths");
+  const hidden = strings(value.hidden_paths, "hidden_paths");
+  if (!hidden.length) failA1("INVALID_VALUE", "name the hidden benchmark files", "hidden_paths");
   for (const item of hidden)
     if (!path.isAbsolute(item))
-      failA1("INVALID_VALUE", "hidden paths must be absolute", "leak_check.hidden_paths");
+      failA1("INVALID_VALUE", "hidden paths must be absolute", "hidden_paths");
   const agent = value.agent as Record<string, unknown>;
   assertNoUnknownFields(agent, ["provider", "model", "mode", "thinking", "paseo_command"], "agent");
   const command = strings(agent.paseo_command ?? ["paseo"], "agent.paseo_command");
@@ -156,19 +159,16 @@ export function validateValidationConfig(value: unknown): ValidationConfig {
   if (!/^[0-9a-f]{64}$/.test(String(value.tester_config_sha256)))
     failA1("INVALID_VALUE", "must be a SHA-256 digest", "tester_config_sha256");
   return {
-    schema_version: 1,
-    metric: {
-      name: requireString(metric.name, "metric.name"),
-      direction: metric.direction,
-      target: requireFiniteNumber(metric.target, "metric.target"),
+    schema_version: 2,
+    pass_rule: {
+      metric: requireString(rule.metric, "pass_rule.metric"),
+      op: rule.op as PassOperator,
+      threshold: requireFiniteNumber(rule.threshold, "pass_rule.threshold"),
     },
     tester_config_sha256: String(value.tester_config_sha256),
     adapter_contract: requireString(value.adapter_contract, "adapter_contract"),
     limits,
-    leak_check: {
-      hidden_paths: hidden,
-      min_match_chars: requireInteger(leak.min_match_chars ?? 40, "leak_check.min_match_chars", 8),
-    },
+    hidden_paths: hidden,
     agent: {
       ...ROLE_AGENT.validator,
       ...optional("model"),
@@ -187,17 +187,6 @@ export function readValidationConfig(root: string): ValidationConfig {
   if (!fs.existsSync(file))
     failA1("VALIDATION_NOT_CONFIGURED", "run /aris-setup validation on this machine");
   return validateValidationConfig(readStateFile(file));
-}
-
-/** The installed benchmark, and every file it pins, must still be the one frozen at setup. */
-export function assertFrozenBenchmark(root: string, config: ValidationConfig): void {
-  const actual = testerFacilityConfigSha256(readTesterFacilityConfig(testerConfigPath(root)));
-  if (actual !== config.tester_config_sha256)
-    failA1(
-      "BENCHMARK_CHANGED",
-      "the installed benchmark differs from the frozen one; validation is stopped",
-    );
-  assertTesterSetupReady(testerConfigPath(root));
 }
 
 export function readValidationToken(root: string): string {
@@ -224,8 +213,11 @@ export function tokenMatches(expected: string, presented: string | undefined): b
   return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-export function meetsTarget(config: ValidationConfig, value: number): boolean {
-  return config.metric.direction === "higher_better"
-    ? value >= config.metric.target
-    : value <= config.metric.target;
+export function passes(rule: PassRule, value: unknown): boolean {
+  if (typeof value !== "number" || !Number.isFinite(value)) return false;
+  if (rule.op === ">=") return value >= rule.threshold;
+  if (rule.op === ">") return value > rule.threshold;
+  if (rule.op === "<=") return value <= rule.threshold;
+  if (rule.op === "<") return value < rule.threshold;
+  return value === rule.threshold;
 }

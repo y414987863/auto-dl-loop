@@ -9,7 +9,15 @@ import path from "node:path";
 import { createCli, runCli } from "../lib/cli.js";
 import { A1Error, failA1 } from "./validate.js";
 import { readValidationConfig } from "./validation/config.js";
-import { finalizeSubmission, runBenchmark } from "./validation/review.js";
+import { readLayers } from "./validation/layers.js";
+import { requestLeakReview } from "./validation/leak-review.js";
+import {
+  evaluate,
+  extendBenchmark,
+  finalizeSubmission,
+  retireBenchmarkLayer,
+  runSmoke,
+} from "./validation/review.js";
 import { startValidationService } from "./validation/server.js";
 import {
   listSubmissions,
@@ -60,7 +68,7 @@ program
 
 program
   .command("status")
-  .description("Service state and submissions, or one submission in full")
+  .description("Service state, benchmark layers and submissions, or one submission in full")
   .requiredOption("--project <dir>")
   .option("--submission <id>")
   .action((options: { project: string; submission?: string }) => {
@@ -75,6 +83,7 @@ program
       else
         print({
           service: serviceSummary(root, config),
+          layers: readLayers(root),
           submissions: listSubmissions(root).map((record) => ({
             ...record,
             published: readPublished(root, record.submission_id),
@@ -85,26 +94,80 @@ program
     }
   });
 
-for (const [name, mode, description] of [
-  ["smoke", "smoke", "Run the frozen benchmark's smoke subset against the adapter"],
-  ["evaluate", "full", "Run the full frozen benchmark; finalize scores the latest run"],
-] as const)
-  program
-    .command(name)
-    .description(description)
-    .requiredOption("--project <dir>")
-    .requiredOption("--submission <id>")
-    .action(async (options: { project: string; submission: string }) => {
-      try {
-        print(await runBenchmark(options.project, options.submission, mode));
-      } catch (error) {
-        fail(error);
-      }
-    });
+program
+  .command("smoke")
+  .description("Run the base layer's smoke subset against the adapter; nothing is counted")
+  .requiredOption("--project <dir>")
+  .requiredOption("--submission <id>")
+  .action(async (options: { project: string; submission: string }) => {
+    try {
+      print(await runSmoke(options.project, options.submission));
+    } catch (error) {
+      fail(error);
+    }
+  });
+
+program
+  .command("evaluate")
+  .description("Run every active benchmark layer, or one; finalize counts the latest run of each")
+  .requiredOption("--project <dir>")
+  .requiredOption("--submission <id>")
+  .option("--layer <id>", "base or inc-NNN; all active layers when omitted")
+  .action(async (options: { project: string; submission: string; layer?: string }) => {
+    try {
+      print(await evaluate(options.project, options.submission, options.layer));
+    } catch (error) {
+      fail(error);
+    }
+  });
+
+program
+  .command("extend")
+  .description("Register a draft layer of tests derived from tests this review has run")
+  .requiredOption("--project <dir>")
+  .requiredOption("--submission <id>")
+  .requiredOption("--draft <dir>", "draft directory inside the submission directory")
+  .action((options: { project: string; submission: string; draft: string }) => {
+    try {
+      print(extendBenchmark(options.project, options.submission, options.draft));
+    } catch (error) {
+      fail(error);
+    }
+  });
+
+program
+  .command("retire")
+  .description("Stop counting a registered layer whose tests are wrong; it is never edited")
+  .requiredOption("--project <dir>")
+  .requiredOption("--submission <id>")
+  .requiredOption("--layer <id>")
+  .requiredOption("--reason <text>")
+  .action((options: { project: string; submission: string; layer: string; reason: string }) => {
+    try {
+      print(
+        retireBenchmarkLayer(options.project, options.submission, options.layer, options.reason),
+      );
+    } catch (error) {
+      fail(error);
+    }
+  });
+
+program
+  .command("leak-review")
+  .description("Start an independent agent that checks feedback.md for hidden test cases")
+  .requiredOption("--project <dir>")
+  .requiredOption("--submission <id>")
+  .action(async (options: { project: string; submission: string }) => {
+    try {
+      print(await requestLeakReview(options.project, options.submission));
+    } catch (error) {
+      fail(error);
+    }
+  });
 
 program
   .command("finalize")
-  .description("Publish review.json and feedback.md after the leak check")
+  .description("Publish review.json, the counted tests and the leak-reviewed feedback.md")
   .requiredOption("--project <dir>")
   .requiredOption("--submission <id>")
   .action((options: { project: string; submission: string }) => {

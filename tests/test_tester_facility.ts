@@ -45,7 +45,7 @@ try {
   assert.equal(readTesterJob(dir).status, "completed");
   assert.deepEqual(await executeTesterJob(dir), result);
   const resultPath = testerResultPath(dir);
-  checkTesterResult(resultPath);
+  assert.equal(checkTesterResult(resultPath).samples.length, 2);
 
   // Recompute hashes so these cases exercise semantic checks, not tamper detection.
   const mutantRaw = path.join(dir, "mutant-raw.json"),
@@ -71,16 +71,12 @@ try {
   rejectsInvalidMeasurement((raw) => {
     raw.samples[1].id = raw.samples[0].id;
   }, "TESTER_COVERAGE_INCOMPLETE");
-  rejectsInvalidMeasurement((raw, changed) => {
-    raw.samples[0].status = "failed";
-    changed.failed_samples = 1;
-  }, "TESTER_COVERAGE_INCOMPLETE");
-  rejectsInvalidMeasurement((raw, changed) => {
-    raw.metrics.score = changed.metrics.score = 100;
-  }, "TESTER_AGGREGATION_MISMATCH");
   rejectsInvalidMeasurement((raw) => {
-    delete raw.samples[0].metrics.score;
-  }, "TESTER_SCORE_MISSING");
+    raw.samples[0].status = "skipped";
+  }, "TESTER_COVERAGE_INCOMPLETE");
+  rejectsInvalidMeasurement((raw) => {
+    raw.samples[0].status = "failed";
+  }, "TESTER_RESULT_BINDING_MISMATCH");
   fs.appendFileSync(path.join(dir, "benchmark-output.json"), " ");
   assert.throws(() => checkTesterResult(resultPath), /TESTER_EVIDENCE_CHANGED/);
 

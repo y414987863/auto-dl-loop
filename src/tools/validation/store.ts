@@ -7,13 +7,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { readStateFile, withStateFileLock, writeStateJsonAtomic } from "../state-file.js";
 import { failA1 } from "../validate.js";
-import { meetsTarget, validationDir, type ValidationConfig } from "./config.js";
+import { validationDir, type ValidationConfig } from "./config.js";
 
 export type SubmissionStatus =
   | "awaiting_upload"
   | "queued"
   | "reviewing"
-  | "scored"
+  | "tested"
   | "rejected_cheating"
   | "unusable"
   /** Not counted: the upload never arrived. */
@@ -21,9 +21,7 @@ export type SubmissionStatus =
   /** Not counted: the deliverable was malformed (zip, size, USAGE.md). */
   | "invalid"
   /** Not counted: our side failed (agent could not start, review timed out). */
-  | "failed"
-  /** Not counted: validation completed or closed before this one was reviewed. */
-  | "cancelled";
+  | "failed";
 
 export interface SubmissionRecord {
   schema_version: 1;
@@ -36,22 +34,36 @@ export interface SubmissionRecord {
   deliverable?: { sha256: string; bytes: number; files: number };
   agent_id?: string;
   review_started_at?: string;
-  /** The full benchmark run finalize scores. */
-  evaluation?: { test_dir: string };
-  feedback_rejections?: number;
-  /** Public reason for expired, invalid, failed and cancelled. */
+  /** Latest full run of each benchmark layer, by layer id; finalize counts these. */
+  evaluations?: Record<string, string>;
+  /** Independent cross-checks of feedback.md, oldest first. */
+  leak_reviews?: LeakReview[];
+  /** Public reason for expired, invalid and failed. */
   reason?: string;
+}
+
+export interface LeakReview {
+  attempt: number;
+  /** The feedback.md this reviewer was given; a later edit needs a new review. */
+  feedback_sha256: string;
+  agent_id: string;
+  dir: string;
+  requested_at: string;
+}
+
+export interface TestCounts {
+  total: number;
+  passed: number;
+  failed: number;
 }
 
 export type Verdict = "valid" | "cheating" | "unusable";
 export interface PublishedResult {
-  schema_version: 1;
+  schema_version: 2;
   submission_id: string;
   verdict: Verdict;
-  /** Null unless the verdict is valid; a cheating verdict voids any measured score. */
-  score: number | null;
-  metric: string;
-  meets_target: boolean;
+  /** Null unless the verdict is valid; a cheating verdict voids every measured test. */
+  tests: TestCounts | null;
   /** Empty when every rewrite still leaked hidden data. */
   feedback: string;
   published_at: string;
@@ -60,18 +72,17 @@ export interface PublishedResult {
 export const COUNTED: readonly SubmissionStatus[] = [
   "queued",
   "reviewing",
-  "scored",
+  "tested",
   "rejected_cheating",
   "unusable",
 ];
 const FINAL: readonly SubmissionStatus[] = [
-  "scored",
+  "tested",
   "rejected_cheating",
   "unusable",
   "expired",
   "invalid",
   "failed",
-  "cancelled",
 ];
 const SUBMISSION_ID = /^s\d{3,}$/;
 
@@ -131,53 +142,33 @@ export function updateSubmission(
   return next;
 }
 
-export type ServiceState = "open" | "completed" | "closed";
+/** Validation only ends when the counted submissions run out. */
+export type ServiceState = "open" | "closed";
 export interface ServiceSummary {
   state: ServiceState;
-  metric: ValidationConfig["metric"];
   max_submissions: number;
   counted: number;
   /** Slots left after counted submissions and live upload reservations. */
   remaining: number;
-  best: { submission_id: string; score: number } | null;
 }
 
 export function serviceSummary(root: string, config: ValidationConfig): ServiceSummary {
   const records = listSubmissions(root),
     now = Date.now();
-  let best: ServiceSummary["best"] = null,
-    completed = false;
-  for (const record of records) {
-    const published = readPublished(root, record.submission_id);
-    if (published?.verdict !== "valid" || published.score === null) continue;
-    if (published.meets_target) completed = true;
-    const better =
-      best === null ||
-      (config.metric.direction === "higher_better"
-        ? published.score > best.score
-        : published.score < best.score);
-    if (better) best = { submission_id: record.submission_id, score: published.score };
-  }
   const counted = records.filter((record) => COUNTED.includes(record.status)).length;
   const reserved = records.filter(
     (record) => record.status === "awaiting_upload" && Date.parse(record.upload!.expires_at) > now,
   ).length;
   const inFlight = records.some((record) => ["queued", "reviewing"].includes(record.status));
   return {
-    state: completed
-      ? "completed"
-      : counted >= config.limits.max_submissions && !inFlight
-        ? "closed"
-        : "open",
-    metric: config.metric,
+    state: counted >= config.limits.max_submissions && !inFlight ? "closed" : "open",
     max_submissions: config.limits.max_submissions,
     counted,
     remaining: Math.max(0, config.limits.max_submissions - counted - reserved),
-    best,
   };
 }
 
-/** Reserve a slot and an upload URL token. Refused once validation has completed or closed. */
+/** Reserve a slot and an upload URL token. Refused once no submissions remain. */
 export function createSubmission(
   root: string,
   config: ValidationConfig,
@@ -185,8 +176,6 @@ export function createSubmission(
 ): { record: SubmissionRecord; upload_token: string } {
   return withSubmissionsLock(root, () => {
     const summary = serviceSummary(root, config);
-    if (summary.state === "completed")
-      failA1("VALIDATION_COMPLETED", "the target was already met; no more submissions");
     if (summary.remaining < 1) failA1("SUBMISSION_LIMIT", "no submissions remain");
     const records = listSubmissions(root);
     const last = records.at(-1);
@@ -213,10 +202,10 @@ export function createSubmission(
   });
 }
 
-export function publish(root: string, result: PublishedResult, config: ValidationConfig): void {
-  if (result.verdict !== "valid" && (result.score !== null || result.meets_target))
-    failA1("INVALID_RESULT", "only a valid verdict carries a score");
-  if (result.score !== null && result.meets_target !== meetsTarget(config, result.score))
-    failA1("INVALID_RESULT", "meets_target disagrees with the frozen target");
+export function publish(root: string, result: PublishedResult): void {
+  if ((result.verdict === "valid") !== (result.tests !== null))
+    failA1("INVALID_RESULT", "exactly the valid verdicts carry test counts");
+  if (result.tests && result.tests.passed + result.tests.failed !== result.tests.total)
+    failA1("INVALID_RESULT", "passed and failed tests must add up to the total");
   writeStateJsonAtomic(publishedFile(root, result.submission_id), result);
 }

@@ -1,22 +1,27 @@
 /**
- * What a validator agent runs against its submission: the frozen benchmark
- * (smoke while writing the adapter, then the full run) and finalize, which
- * turns review.json and feedback.md into the published result. The score is
- * read from the checked benchmark result, never from the agent's text.
+ * What a validator agent runs against its submission: the base smoke subset
+ * while writing the adapter, full runs of every benchmark layer, new layers
+ * derived from tests it has run, and finalize, which turns review.json and the
+ * leak-reviewed feedback.md into the published result. Test counts are read
+ * from the checked runs, never from the agent's text.
  */
 import fs from "node:fs";
 import path from "node:path";
 import { readStateFile } from "../state-file.js";
-import {
-  checkTesterResult,
-  executeTesterJob,
-  prepareTesterJob,
-  testerConfigPath,
-  testerResultPath,
-} from "../tester-facility.js";
+import { executeTesterJob, prepareTesterJob, testerConfigPath } from "../tester-facility.js";
 import { failA1, isRecord } from "../validate.js";
-import { assertFrozenBenchmark, meetsTarget, readValidationConfig } from "./config.js";
-import { checkLeak } from "./leak.js";
+import { readValidationConfig, type ValidationConfig } from "./config.js";
+import {
+  activeLayers,
+  assertBenchmarkIntact,
+  BASE_LAYER,
+  countLayerRun,
+  registerLayer,
+  retireLayer,
+  runLayer,
+  type LayerRun,
+} from "./layers.js";
+import { clearedFeedback, feedbackText } from "./leak-review.js";
 import {
   publish,
   readSubmission,
@@ -27,11 +32,11 @@ import {
   withSubmissionsLock,
   type SubmissionRecord,
   type SubmissionStatus,
+  type TestCounts,
   type Verdict,
 } from "./store.js";
 
 const MAX_FEEDBACK_CHARS = 20_000;
-const RUN_DIRS = { smoke: "smoke", full: "evaluation" } as const;
 
 function reviewing(root: string, id: string): SubmissionRecord {
   const record = readSubmission(root, id);
@@ -40,53 +45,132 @@ function reviewing(root: string, id: string): SubmissionRecord {
   return record;
 }
 
-/** Each attempt gets a new directory: a tester job directory binds one request for good. */
-export async function runBenchmark(projectRoot: string, id: string, mode: "smoke" | "full") {
-  const root = path.resolve(projectRoot);
-  const config = readValidationConfig(root);
-  const record = reviewing(root, id);
-  assertFrozenBenchmark(root, config);
-  const base = path.join(submissionDir(root, id), RUN_DIRS[mode]);
+/** Each attempt gets a new numbered directory: a test directory binds one run for good. */
+function nextRunDir(base: string): { dir: string; attempt: number } {
   fs.mkdirSync(base, { recursive: true });
   const attempt = Math.max(0, ...fs.readdirSync(base).map(Number).filter(Number.isInteger)) + 1;
   const dir = path.join(base, String(attempt));
   fs.mkdirSync(dir);
+  return { dir, attempt };
+}
+
+function artifactOf(root: string, id: string, record: SubmissionRecord) {
   const adapter = path.join(submissionDir(root, id), "adapter");
-  prepareTesterJob(dir, testerConfigPath(root), {
-    schema_version: 1,
-    test_id: `${id}-${mode === "full" ? "e" : "s"}${attempt}`,
+  return {
     artifact: { ref: unpackedDir(root, id), sha256: record.deliverable!.sha256 },
     ...(fs.existsSync(adapter) ? { adapter_dir: adapter } : {}),
-    mode,
+  };
+}
+
+/** The base layer's smoke subset, for iterating on the adapter. Nothing is counted. */
+export async function runSmoke(projectRoot: string, id: string) {
+  const root = path.resolve(projectRoot);
+  const config = readValidationConfig(root);
+  const record = reviewing(root, id);
+  assertBenchmarkIntact(root, config);
+  const { dir, attempt } = nextRunDir(path.join(submissionDir(root, id), "smoke"));
+  prepareTesterJob(dir, testerConfigPath(root), {
+    schema_version: 1,
+    test_id: `${id}-s${attempt}`,
+    ...artifactOf(root, id, record),
+    mode: "smoke",
   });
-  if (mode === "full")
-    withSubmissionsLock(root, () => updateSubmission(root, id, { evaluation: { test_dir: dir } }));
   const result = await executeTesterJob(dir);
   return {
     submission_id: id,
     test_dir: dir,
-    metrics: result.metrics,
     sample_count: result.sample_count,
     failed_samples: result.failed_samples,
   };
 }
 
-/** Benchmark sample ids seen by any run of this submission; feedback must not name them. */
-function sampleIds(dir: string): string[] {
-  const ids: string[] = [];
-  for (const kind of Object.values(RUN_DIRS)) {
-    const base = path.join(dir, kind);
-    if (!fs.existsSync(base)) continue;
-    for (const attempt of fs.readdirSync(base)) {
-      const output = path.join(base, attempt, "benchmark-output.json");
-      if (!fs.existsSync(output)) continue;
-      const raw = readStateFile<unknown>(output);
-      if (isRecord(raw) && Array.isArray(raw.samples))
-        for (const sample of raw.samples)
-          if (isRecord(sample) && typeof sample.id === "string") ids.push(sample.id);
-    }
+/** Full runs of one layer, or of every active layer in order; each run is counted on return. */
+export async function evaluate(projectRoot: string, id: string, layer?: string) {
+  const root = path.resolve(projectRoot);
+  const config = readValidationConfig(root);
+  const layers = layer ? [layer] : activeLayers(root);
+  if (layer && !activeLayers(root).includes(layer))
+    failA1("UNKNOWN_LAYER", `${layer} is not an active benchmark layer`);
+  const runs: { layer: string; test_dir: string; tests: TestCounts }[] = [];
+  for (const name of layers) {
+    const record = reviewing(root, id);
+    assertBenchmarkIntact(root, config);
+    const { dir, attempt } = nextRunDir(path.join(submissionDir(root, id), "evaluation", name));
+    const request = { test_id: `${id}-${name}-e${attempt}`, ...artifactOf(root, id, record) };
+    withSubmissionsLock(root, () =>
+      updateSubmission(root, id, {
+        evaluations: { ...readSubmission(root, id).evaluations, [name]: dir },
+      }),
+    );
+    if (name === BASE_LAYER) {
+      prepareTesterJob(dir, testerConfigPath(root), {
+        schema_version: 1,
+        ...request,
+        mode: "full",
+      });
+      await executeTesterJob(dir);
+    } else await runLayer(root, name, dir, request);
+    const run = countLayerRun(root, config, name, dir, record.deliverable!.sha256);
+    runs.push({ layer: name, test_dir: dir, tests: run.counts });
   }
-  return ids;
+  return { submission_id: id, runs };
+}
+
+/** The latest run of every active layer, counted; a missing or unfinished one is an error. */
+function countActiveLayers(
+  root: string,
+  config: ValidationConfig,
+  record: SubmissionRecord,
+): Map<string, LayerRun> {
+  const runs = new Map<string, LayerRun>();
+  const missing = activeLayers(root).filter((layer) => !record.evaluations?.[layer]);
+  if (missing.length)
+    failA1(
+      "EVALUATION_REQUIRED",
+      `run evaluate for every active layer first; missing: ${missing.join(", ")}`,
+    );
+  for (const layer of activeLayers(root))
+    runs.set(
+      layer,
+      countLayerRun(root, config, layer, record.evaluations![layer]!, record.deliverable!.sha256),
+    );
+  return runs;
+}
+
+/**
+ * Register a draft layer from inside the submission directory. Its tests may
+ * only derive from tests this review has already run on every active layer.
+ */
+export function extendBenchmark(projectRoot: string, id: string, draft: string) {
+  const root = path.resolve(projectRoot);
+  const config = readValidationConfig(root);
+  const record = reviewing(root, id);
+  assertBenchmarkIntact(root, config);
+  const source = path.resolve(draft);
+  const relative = path.relative(submissionDir(root, id), source);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative))
+    failA1("INVALID_LAYER", "write the draft layer inside the submission directory");
+  const known = new Set(
+    [...countActiveLayers(root, config, record).values()].flatMap((run) => run.test_ids),
+  );
+  const layer = registerLayer(root, {
+    submission_id: id,
+    draft: source,
+    known,
+    limit: config.limits.max_new_tests_per_review,
+  });
+  return { submission_id: id, layer, next: `evaluate --layer ${layer.id}` };
+}
+
+export function retireBenchmarkLayer(
+  projectRoot: string,
+  id: string,
+  layer: string,
+  reason: string,
+) {
+  const root = path.resolve(projectRoot);
+  reviewing(root, id);
+  return retireLayer(root, id, layer, reason);
 }
 
 function readReview(dir: string): Verdict {
@@ -107,79 +191,46 @@ function readReview(dir: string): Verdict {
   return review.verdict as Verdict;
 }
 
-/** A valid verdict is scored from the latest full run, which must pass the tester's own checks. */
-function measuredScore(root: string, record: SubmissionRecord): number {
-  const config = readValidationConfig(root);
-  if (!record.evaluation) failA1("EVALUATION_REQUIRED", "run evaluate before a valid verdict");
-  const result = checkTesterResult(testerResultPath(record.evaluation.test_dir));
-  assertFrozenBenchmark(root, config);
-  if (result.config_sha256 !== config.tester_config_sha256)
-    failA1("BENCHMARK_CHANGED", "the evaluation ran on a different benchmark");
-  if (result.request.artifact.sha256 !== record.deliverable!.sha256)
-    failA1("EVALUATION_MISMATCH", "the evaluation tested a different deliverable");
-  const score = result.metrics[config.metric.name];
-  if (score === undefined || !Number.isFinite(score))
-    failA1("METRIC_MISSING", `the evaluation has no ${config.metric.name} value`);
-  return score;
-}
-
 export function finalizeSubmission(projectRoot: string, id: string) {
   const root = path.resolve(projectRoot);
   const config = readValidationConfig(root);
   const record = reviewing(root, id);
   const dir = submissionDir(root, id);
   const verdict = readReview(dir);
-  const feedbackFile = path.join(dir, "feedback.md");
-  let feedback = fs.existsSync(feedbackFile) ? fs.readFileSync(feedbackFile, "utf8").trim() : "";
-  if (feedback.length > MAX_FEEDBACK_CHARS)
+  const draft = feedbackText(dir);
+  if (draft.length > MAX_FEEDBACK_CHARS)
     failA1("FEEDBACK_TOO_LONG", `keep feedback.md under ${MAX_FEEDBACK_CHARS} characters`);
-  // Cheating voids the score, and an unusable deliverable has none.
-  const score = verdict === "valid" ? measuredScore(root, record) : null;
-
-  const leak = checkLeak(
-    feedback,
-    config.leak_check.hidden_paths,
-    config.leak_check.min_match_chars,
-    sampleIds(dir),
-  );
-  if (leak.leaked) {
-    const rejections = (record.feedback_rejections ?? 0) + 1;
-    if (rejections <= config.limits.feedback_attempts) {
-      withSubmissionsLock(root, () =>
-        updateSubmission(root, id, { feedback_rejections: rejections }),
-      );
-      failA1(
-        "FEEDBACK_LEAKS_HIDDEN_DATA",
-        `feedback.md quotes hidden benchmark data; rewrite it with invented examples (${config.limits.feedback_attempts - rejections + 1} attempts left). Matches: ${JSON.stringify(leak.matches)}`,
-      );
+  // Cheating voids every measured test, and an unusable deliverable has none.
+  let tests: TestCounts | null = null;
+  if (verdict === "valid") {
+    assertBenchmarkIntact(root, config);
+    tests = { total: 0, passed: 0, failed: 0 };
+    for (const run of countActiveLayers(root, config, record).values()) {
+      tests.total += run.counts.total;
+      tests.passed += run.counts.passed;
+      tests.failed += run.counts.failed;
     }
-    feedback = "";
   }
+  const { feedback, withheld } = clearedFeedback(record, draft, config.limits.feedback_attempts);
 
   return withSubmissionsLock(root, () => {
     reviewing(root, id);
-    publish(
-      root,
-      {
-        schema_version: 1,
-        submission_id: id,
-        verdict,
-        score,
-        metric: config.metric.name,
-        meets_target: score !== null && meetsTarget(config, score),
-        feedback,
-        published_at: new Date().toISOString(),
-      },
-      config,
-    );
+    publish(root, {
+      schema_version: 2,
+      submission_id: id,
+      verdict,
+      tests,
+      feedback,
+      published_at: new Date().toISOString(),
+    });
     const status: SubmissionStatus =
-      verdict === "valid" ? "scored" : verdict === "cheating" ? "rejected_cheating" : "unusable";
+      verdict === "valid" ? "tested" : verdict === "cheating" ? "rejected_cheating" : "unusable";
     updateSubmission(root, id, { status });
     return {
       submission_id: id,
       status,
-      score,
-      feedback_withheld: leak.leaked,
+      tests,
+      feedback_withheld: withheld,
       service: serviceSummary(root, config),
     };
   });

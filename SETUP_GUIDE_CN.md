@@ -1,6 +1,6 @@
 # Auto Research Loop（ARL）安装
 
-ARL 使用两台机器：worker 交付 zip，validation 持有冻结 benchmark、评分并发布脱敏反馈。双方只通过 `submit` 和 `query` MCP 工具交互。规划、编码、调试和委派由 agent 自己完成，不恢复旧的固定研究流水线。
+ARL 使用两台机器：worker 交付 zip，validation 持有只增不改的 benchmark，作为 worker 的对抗方测试每次提交，发布结论、测试项通过数和经泄漏审查的反馈。双方只通过 `submit` 和 `query` MCP 工具交互。规划、编码、调试和委派由 agent 自己完成，不恢复旧的固定研究流水线。
 
 两台机器都使用官方 Paseo 和官方 CLI。ARL 从本地源码仓库安装项目技能、编译好的 Node helper、运行依赖和模板，不需要定制 Paseo。官方 App 可查看 agent 和服务脚本，没有定制版 ARIS 知识图谱标签页；wiki 通过技能和文件读取。
 
@@ -46,14 +46,14 @@ setup 写入角色指令，以及 worker 在 `.mcp.json` 中的 `aris-validation
 两台机器建立独立项目并加入官方 Paseo，不共享磁盘、仓库或同步目录。项目 `.gitignore` 排除 `.aris/` 和 worker 的 `.mcp.json`，因为它们包含凭据。
 
 1. 验证端先写 `task.md`，以 thinking `max` 打开 Codex 并调用 `$aris-setup`；角色来自安装记录，无需指定。
-2. 一次审阅完整配置表：benchmark 固定源码/数据版本、切分、样本数、runner argv、指标目标、隐藏文件、次数和服务地址。validator agent 固定为 Codex `max`，配置表只设置其 model 和 mode；服务以 `--provider codex --thinking max` 为每次提交启动一个 agent。
-3. 确认配置摘要后，setup 执行 benchmark 安装、healthcheck 和 smoke，冻结配置，生成 token，将 `aris-validation` 服务写入 `paseo.json`，并初始化 `research-wiki/` 作为验证端的长期记忆：记录各次提交暴露的验证问题、哪些已解决、哪些仍存在。从官方 Paseo 启动该服务。
+2. 一次审阅完整配置表：benchmark 固定源码/数据版本、切分、样本数、runner argv 和指标；逐样本通过规则 `pass_rule`（`metric`、`op` 取 `>=` `>` `<=` `<` `==` 之一、`threshold`），每个样本即一个测试项；adapter 约定；`hidden_paths`，即隐藏样本、标签和参考答案的绝对路径，泄漏审查 agent 对照它们检查反馈；次数、上传、评审超时、`feedback_attempts` 和 `max_new_tests_per_review`（默认 200）等限制；以及服务地址。validator agent 固定为 Codex `max`，配置表只设置其 model 和 mode；服务以 `--provider codex --thinking max` 为每次提交启动一个 agent，`validation-cli leak-review` 以同样的 agent 配置启动独立的反馈泄漏审查 agent。
+3. 确认配置摘要后，setup 执行 benchmark 安装、healthcheck 和 smoke，冻结 base 层 benchmark 和通过规则，生成 token，将 `aris-validation` 服务写入 `paseo.json`，并初始化 `research-wiki/` 作为验证端的长期记忆：记录各次提交暴露的问题、哪些已解决、哪些仍存在。从官方 Paseo 启动该服务。benchmark 只增不改：已有提交按 base 层和通过规则测试过后，要改它们只能新建 validator 项目；validator agent 用 `validation-cli extend` 新增 `inc-001` 等层，每个测试项从已有测试项派生；每一层是 helper 自有 git 仓库 `.aris/validation/benchmark/` 里一个只新增文件的提交，head 记录在 `.aris/validation/benchmark-head`，helper 逐个提交检查历史只增不改。已登记的层不能修改，错了的层用 `validation-cli retire` 停用（同样只新增文件）；固定的文件或这段历史有任何改动，服务就停止。
 4. 私下把输出的 URL/token 和相同 `task.md` 交给 worker。worker 以 thinking `ultracode` 打开 Claude Code 并运行 `/aris-setup`，在同一配置表中填写连接，以及环境脚本所需的密钥（`environment.secrets`），审阅后确认。setup 把角色段写入 `CLAUDE.md`，把 MCP 条目写入 `.mcp.json`，并初始化 `research-wiki/`。
-5. 两端的 setup 最后都写入[环境技能](#环境技能)。用户随后在客户端执行 `reload-skills` 加载技能；客户端没有重载动作时重新打开会话，worker 的 MCP 配置变更也需要新会话。验证 `query` 返回 open，再让 worker 执行任务。合法提交达标时 completed，次数耗尽时 closed。
+5. 两端的 setup 最后都写入[环境技能](#环境技能)。用户随后在客户端执行 `reload-skills` 加载技能；客户端没有重载动作时重新打开会话，worker 的 MCP 配置变更也需要新会话。验证 `query` 返回 open，再让 worker 执行任务。唯一的停止条件是计次提交用完（closed）；通过全部现有测试项不会结束任务，因为 validator 会继续增加测试项。
 
 worker 的 `CLAUDE.md` 角色段规定带编号的迭代流程，必须逐步执行：research-wiki 是必须使用的长期记忆，当前迭代的短期任务写入 todo 列表，每次提交前先 commit。角色段同时列出 `submit` / `query`、`research-wiki`、`browser-act` 和环境技能的入口。浏览器 CLI 按需检查或安装。使用前读取对应 skill。
 
-每次提交取得 validation 已发布的最终结论后，worker 将有实际依据、可跨项目复用的经验精简后提交到本地 ARL 源码仓库 `experience` 分支根目录的 `Experience.md`：该分支不存在时从 `main` 新建，存在则直接提交（在独立 worktree 中进行，不切换源码仓库当前分支），合并重复经验，无新经验则不添加；项目细节留在 wiki。worker 不推送也不合并：由你推送 `experience` 并发起合并到 `main` 的 PR，审核通过后其他项目才会读取。setup 在 worker 的 `CLAUDE.md` 中记录源码仓库和 worktree 位置，源码 checkout 需可写，其中的 `CLAUDE.md` 指向 `Experience.md`；安装目录 `.aris/` 不是经验仓库。保存规则见[经验保存约定](skills/shared-references/experience.md)；即使达标或次数耗尽，也应完成经验整理后再结束。
+每次提交取得 validation 已发布的最终结论后，worker 将有实际依据、可跨项目复用的经验精简后提交到本地 ARL 源码仓库 `experience` 分支根目录的 `Experience.md`：该分支不存在时从 `main` 新建，存在则直接提交（在独立 worktree 中进行，不切换源码仓库当前分支），合并重复经验，无新经验则不添加；项目细节留在 wiki。worker 不推送也不合并：由你推送 `experience` 并发起合并到 `main` 的 PR，审核通过后其他项目才会读取。setup 在 worker 的 `CLAUDE.md` 中记录源码仓库和 worktree 位置，源码 checkout 需可写，其中的 `CLAUDE.md` 指向 `Experience.md`；安装目录 `.aris/` 不是经验仓库。保存规则见[经验保存约定](skills/shared-references/experience.md)；即使次数耗尽，也应完成经验整理后再结束。
 
 私网/VPN 直连：`host=0.0.0.0`、固定 port（如 8790）、`public_url=http://<验证端地址>:8790`，开放防火墙端口。已有 Paseo service proxy 时可用 `host=127.0.0.1`、port=null 和脚本代理 URL。安装包不配置 DNS/proxy。
 
@@ -67,7 +67,7 @@ Windows 验证端的 `agent.paseo_command` 使用 `["node", "<Paseo install>\\bi
 
 ## 升级
 
-显式更新本地源码仓库并运行 `npm run build`（锁文件变化时先运行 `npm ci`），再用相同角色运行 `distribution/install-aris.sh --role ... --project ...`，可先加 `--dry-run`。安装器基于当前本地文件生成临时文件包并校验哈希，管理 `.aris/install.json` 中登记的角色和文件，补回缺失文件，删除包内已移除的受管文件，拒绝覆盖本地修改。保存修改后可明确使用 `--force`。任务、wiki、benchmark、提交记录、setup 状态、`.aris/environment.json` 和环境技能不覆盖。已安装项目不能更换角色；没有角色记录的旧安装和旧版本 wiki 不迁移，请安装到新项目并新建 `research-wiki/`。
+显式更新本地源码仓库并运行 `npm run build`（锁文件变化时先运行 `npm ci`），再用相同角色运行 `distribution/install-aris.sh --role ... --project ...`，可先加 `--dry-run`。安装器基于当前本地文件生成临时文件包并校验哈希，管理 `.aris/install.json` 中登记的角色和文件，补回缺失文件，删除包内已移除的受管文件，拒绝覆盖本地修改。保存修改后可明确使用 `--force`。任务、wiki、benchmark、提交记录、setup 状态、`.aris/environment.json` 和环境技能不覆盖。已安装项目不能更换角色；没有角色记录的旧安装和旧版本 wiki 不迁移，请安装到新项目并新建 `research-wiki/`。validation 配置 `schema_version` 低于 2（使用分数和目标而非逐样本通过规则）的旧 validator 项目不迁移：还没有计次提交的，在验证端重新运行 `$aris-setup`，配置 `pass_rule` 和 `hidden_paths`；已有计次提交的，需新开一个 validator 项目。
 
 已配置项目升级后执行 `node .aris/dist/tools/setup-cli.js apply --project .` 更新角色段，再执行客户端的 `reload-skills`；MCP 配置变更或客户端无重载动作时重新打开会话，无需重启 daemon。旧定制版安装没有独立包清单，先备份并优先使用新项目，或检查冲突后选择 `--force`；安装器不会删除旧全局链接和用户 agent 文件。
 

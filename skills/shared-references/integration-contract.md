@@ -32,7 +32,7 @@ helper's error and the step it blocked. Do not:
 | Helper | Used by | Failure |
 | --- | --- | --- |
 | `setup-cli.js` | `/aris-setup` | Stop setup. The helper owns the draft, the review and the confirmed digest. |
-| `validation-cli.js` | validator machine, `validation-review` | Stop the review. The service owns submission records and published results. |
+| `validation-cli.js` | validator machine, `validation-review` | Stop the review. The helper owns submission records, benchmark layers and published results. |
 | `research-wiki.js` | `/research-wiki`, literature skills | Stop the wiki write. Never create wiki files by hand. |
 | `threat-scan` (inside `research-wiki.js`) | `/research-wiki` | Quarantines strict-scope hits; see [injection-hygiene.md](injection-hygiene.md). |
 | `capture-filter.js` | `/research-wiki` | Rewrite or drop the flagged note; see [capture-antipatterns.md](capture-antipatterns.md). |

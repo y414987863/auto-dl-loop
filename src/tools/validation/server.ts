@@ -13,13 +13,13 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { A1Error, failA1, isRecord } from "../validate.js";
 import {
-  assertFrozenBenchmark,
   readValidationConfig,
   readValidationToken,
   tokenMatches,
   type ValidationConfig,
 } from "./config.js";
 import { paseoDispatcher, type Dispatcher } from "./dispatch.js";
+import { assertBenchmarkIntact } from "./layers.js";
 import {
   createSubmission,
   deliverableZip,
@@ -68,7 +68,7 @@ const TOOLS = [
   {
     name: "query",
     description:
-      "Service state (open, completed, closed), submissions left, the best score so far and, for one submission, its status, verdict, score and desensitized feedback.",
+      "Service state (open or closed), submissions left and, for one submission, its status, verdict, how many tests it passed out of how many, and feedback on the problems found. The tests themselves stay hidden.",
     inputSchema: {
       type: "object",
       properties: { submission_id: { type: "string", description: "For example s001." } },
@@ -79,7 +79,7 @@ const TOOLS = [
 
 function submitTool(root: string, config: ValidationConfig, args: Record<string, unknown>) {
   // A changed benchmark stops reviews; taking uploads would only drain the budget.
-  assertFrozenBenchmark(root, config);
+  assertBenchmarkIntact(root, config);
   const note = typeof args.note === "string" ? args.note : undefined;
   const { record, upload_token } = createSubmission(root, config, note);
   const url = `${config.service.public_url}/upload/${record.submission_id}/${upload_token}`;
@@ -103,8 +103,7 @@ function submissionView(root: string, record: SubmissionRecord) {
     ...(published
       ? {
           verdict: published.verdict,
-          score: published.score,
-          meets_target: published.meets_target,
+          tests: published.tests,
           feedback: published.feedback,
           published_at: published.published_at,
         }
@@ -131,7 +130,7 @@ function queryTool(
       return {
         submission_id: record.submission_id,
         status: record.status,
-        ...(published ? { verdict: published.verdict, score: published.score } : {}),
+        ...(published ? { verdict: published.verdict, tests: published.tests } : {}),
       };
     }),
   };
@@ -163,7 +162,7 @@ export async function startValidationService(
 ): Promise<RunningService> {
   const root = path.resolve(projectRoot);
   const config = readValidationConfig(root);
-  assertFrozenBenchmark(root, config);
+  assertBenchmarkIntact(root, config);
   const token = readValidationToken(root);
   const dispatch = options.dispatcher ?? paseoDispatcher(config.agent);
   const log = options.log ?? ((line: string) => console.log(line));
@@ -185,7 +184,7 @@ export async function startValidationService(
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "aris-validation", version: "1.0.0" },
         instructions:
-          "Submit deliverables with `submit` (put the commit hash in `note`), upload the zip with the returned curl.exe command, then poll `query` until the submission's status is final. scored, rejected_cheating and unusable carry a verdict; invalid, expired, failed and cancelled do not count: read `reason`, fix it and submit again. Stop when the state is completed or closed; while reviews are in flight with no submissions remaining, keep polling.",
+          "Submit deliverables with `submit` (put the commit hash in `note`), upload the zip with the returned curl.exe command, then poll `query` until the submission's status is final. tested, rejected_cheating and unusable carry a verdict; invalid, expired and failed do not count: read `reason`, fix it and submit again. The validator keeps adding hidden tests derived from the problems it finds, so the test total grows; fix the problems the feedback describes rather than chasing a number. Stop only when the state is closed; while reviews are in flight with no submissions remaining, keep polling.",
       });
     }
     if (method === "ping") return ok({});
@@ -328,21 +327,15 @@ export async function startValidationService(
   async function runTick(): Promise<void> {
     const now = Date.now();
     const next = withSubmissionsLock(root, () => {
-      const summary = serviceSummary(root, config);
       let reviewing = 0;
       let candidate: SubmissionRecord | null = null;
       for (const record of listSubmissions(root)) {
         const id = record.submission_id;
         if (record.status === "awaiting_upload" && !uploading.has(id)) {
-          if (summary.state === "completed")
-            updateSubmission(root, id, { status: "cancelled", reason: "validation completed" });
-          else if (Date.parse(record.upload!.expires_at) <= now)
+          if (Date.parse(record.upload!.expires_at) <= now)
             updateSubmission(root, id, { status: "expired", reason: "no upload arrived in time" });
-        } else if (record.status === "queued") {
-          if (summary.state === "completed")
-            updateSubmission(root, id, { status: "cancelled", reason: "validation completed" });
-          else candidate ??= record;
-        } else if (record.status === "reviewing") {
+        } else if (record.status === "queued") candidate ??= record;
+        else if (record.status === "reviewing") {
           const started = Date.parse(record.review_started_at ?? record.updated_at);
           if (now - started > config.limits.review_timeout_minutes * 60_000)
             updateSubmission(root, id, {
@@ -354,7 +347,7 @@ export async function startValidationService(
       }
       if (!candidate || reviewing >= config.limits.max_concurrent) return null;
       try {
-        assertFrozenBenchmark(root, config);
+        assertBenchmarkIntact(root, config);
         blocked = null;
       } catch (error) {
         blocked = (error as Error).message;
