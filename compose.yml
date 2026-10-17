@@ -1,0 +1,71 @@
+# 一份 docker/Dockerfile 起两个 Paseo 服务：worker 和 validator。构建上下文是仓库根目录。
+#
+#   cp .env.docker.example .env       # 至少改掉 PASEO_PASSWORD，再配置 API endpoint 和 token
+#   docker compose build
+#   docker compose up -d
+#
+# 两个服务各有自己的 /home/paseo 和 /workspace，不要共享：validator 的 benchmark 不能进 worker 环境。两者只通过 validation 服务的 submit / query 交互。
+#
+# 宿主端口 6767（worker）和 6768（validator）：浏览器打开 http://localhost:6767，或把桌面端 / `paseo` CLI 指向 127.0.0.1:6768。
+
+services:
+  paseo-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    image: arl-paseo:worker
+    # 只用本地构建的产物，不要去 Docker Hub 找同名镜像
+    pull_policy: build
+    container_name: paseo-worker
+    restart: unless-stopped
+    ports:
+      - "6767:6767"
+    environment:
+      PASEO_PASSWORD: "${PASEO_PASSWORD:?必须在 .env 里设置 PASEO_PASSWORD}"
+      # Claude Code 配置：使用第三方 API 时需配置 BASE_URL、AUTH_TOKEN 和 MODEL
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+      ANTHROPIC_AUTH_TOKEN: "${ANTHROPIC_AUTH_TOKEN}"
+      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-opus-5}"
+      ANTHROPIC_SMALL_FAST_MODEL: "${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4-5-20251001}"
+      # 可选：用域名访问时需设置（多个用逗号分隔）
+      # PASEO_HOSTNAMES: "${PASEO_HOSTNAMES:-}"
+    volumes:
+      - ./docker/worker/paseo-home:/home/paseo
+      - ./docker/worker/workspace:/workspace
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({hostname:'127.0.0.1',port:6767,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  paseo-validator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: validator
+    image: arl-paseo:validator
+    # 只用本地构建的产物，不要去 Docker Hub 找同名镜像
+    pull_policy: build
+    container_name: paseo-validator
+    restart: unless-stopped
+    ports:
+      - "6768:6767"
+    environment:
+      PASEO_PASSWORD: "${PASEO_PASSWORD:?必须在 .env 里设置 PASEO_PASSWORD}"
+      # Codex 配置：使用第三方 API 时需配置 BASE_URL（注意末尾要加 /v1）、API_KEY 和 MODEL
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-5.5}"
+      # 可选：用域名访问时需设置（多个用逗号分隔）
+      # PASEO_HOSTNAMES: "${PASEO_HOSTNAMES:-}"
+    volumes:
+      - ./docker/validator/paseo-home:/home/paseo
+      - ./docker/validator/workspace:/workspace
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({hostname:'127.0.0.1',port:6767,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

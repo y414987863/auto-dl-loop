@@ -1,0 +1,20 @@
+# 所有文本一律 LF：Docker 构建上下文是工作区而不是 git blob，Windows 上 `core.autocrlf=true` 检出的 CRLF 会直接进镜像，而 CRLF 的 shebang 会让内核找不到解释器、退回 dash。
+* text=auto eol=lf
+
+# 下面这些显式声明覆盖上面的通配规则（gitattributes 后匹配者优先）。
+*.sh text eol=lf
+*.bash text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 二进制和 fixture：不要动换行。
+*.png binary
+*.ico binary
+*.gz binary
+*.zip binary
