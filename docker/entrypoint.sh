@@ -61,12 +61,12 @@ for d in /home/paseo/.codex /home/paseo/.claude /home/paseo/.paseo; do
   [ -d "$d" ] && chown -R paseo:paseo "$d" 2>/dev/null || true
 done
 
-# Codex 配置：从环境变量生成 config.toml 和 auth.json（validator）
-if [ -n "${OPENAI_API_KEY:-}" ] && [ "$role" = "validator" ]; then
+# Codex 配置：从环境变量生成 config.toml 和 auth.json（validator）；缺失的变量写空串
+if [ "$role" = "validator" ]; then
   mkdir -p /home/paseo/.codex
   cat > /home/paseo/.codex/auth.json <<EOF
 {
-  "OPENAI_API_KEY": "$OPENAI_API_KEY"
+  "OPENAI_API_KEY": "${OPENAI_API_KEY:-}"
 }
 EOF
   cat > /home/paseo/.codex/config.toml <<EOF
@@ -84,14 +84,14 @@ EOF
   chown -R paseo:paseo /home/paseo/.codex
 fi
 
-# Claude Code 配置：从环境变量生成 settings.json（worker）
-if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && [ "$role" = "worker" ]; then
+# Claude Code 配置：从环境变量生成 settings.json（worker）；缺失的变量写空串
+if [ "$role" = "worker" ]; then
   mkdir -p /home/paseo/.claude
   cat > /home/paseo/.claude/settings.json <<EOF
 {
   "env": {
     "ANTHROPIC_BASE_URL": "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}",
-    "ANTHROPIC_AUTH_TOKEN": "$ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN": "${ANTHROPIC_AUTH_TOKEN:-}",
     "ANTHROPIC_MODEL": "${ANTHROPIC_MODEL:-claude-opus-5}",
     "ANTHROPIC_SMALL_FAST_MODEL": "${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4-5-20251001}"
   },
