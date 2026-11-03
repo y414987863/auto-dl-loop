@@ -34,7 +34,13 @@ services:
       - ./docker/worker/paseo-home:/home/paseo
       - ./docker/worker/workspace:/workspace
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get({hostname:'127.0.0.1',port:6767,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get({hostname:'127.0.0.1',port:6767,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       start_period: 60s
@@ -64,7 +70,13 @@ services:
       - ./docker/validator/paseo-home:/home/paseo
       - ./docker/validator/workspace:/workspace
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get({hostname:'127.0.0.1',port:6767,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get({hostname:'127.0.0.1',port:6767,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       start_period: 60s

@@ -33,14 +33,14 @@ if [ ! -d "$checkout/.git" ]; then
 fi
 
 # install.json 记录了角色，所以已装过的项目保持原角色，只有首次或显式修复才重装。
-if [ "${ARL_FORCE_INSTALL:-0}" = "1" ] || [ ! -f "$project/.aris/install.json" ]; then
+if [ "${ARL_FORCE_INSTALL:-0}" = "1" ] || [ ! -f "$project/.contrejour/install.json" ]; then
   echo "installing ARL role '$role' into $project"
-  if ! gosu paseo bash "$checkout/distribution/install-aris.sh" --role "$role" --project "$project"; then
+  if ! gosu paseo bash "$checkout/distribution/install-contrejour.sh" --role "$role" --project "$project"; then
     echo "ARL installation failed; the Paseo daemon will still start." >&2
     echo "Run again with ARL_FORCE_INSTALL=1, or install inside the running container:" >&2
-    echo "  docker exec -it --user root <container> bash $checkout/distribution/install-aris.sh --role $role --project $project" >&2
+    echo "  docker exec -it --user root <container> bash $checkout/distribution/install-contrejour.sh --role $role --project $project" >&2
   else
-    gosu paseo node "$project/.aris/dist/tools/setup-cli.js" apply --project "$project" >/dev/null 2>&1 || true
+    gosu paseo node "$project/.contrejour/dist/tools/setup-cli.js" apply --project "$project" >/dev/null 2>&1 || true
     # 每次提交都对应一个 Git commit，所以项目要有初始 commit；分支钉在 main。
     gosu paseo bash -c "
       cd '$project' || exit 1
