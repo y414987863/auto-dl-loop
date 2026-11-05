@@ -28,6 +28,10 @@ services:
       ANTHROPIC_AUTH_TOKEN: "${ANTHROPIC_AUTH_TOKEN}"
       ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-opus-5}"
       ANTHROPIC_SMALL_FAST_MODEL: "${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4-5-20251001}"
+      # 上游协议：anthropic（默认，直连）或 openai_chat（经容器内 cc-switch 转换）
+      LLM4AD_UPSTREAM_API_FORMAT: "${LLM4AD_UPSTREAM_API_FORMAT:-anthropic}"
+      # 可选：cc-switch 本地代理端口
+      # LLM4AD_PROTOCOL_PROXY_PORT: "${LLM4AD_PROTOCOL_PROXY_PORT:-17821}"
       # 可选：用域名访问时需设置（多个用逗号分隔）
       # PASEO_HOSTNAMES: "${PASEO_HOSTNAMES:-}"
     volumes:

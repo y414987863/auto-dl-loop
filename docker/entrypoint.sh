@@ -86,12 +86,34 @@ fi
 
 # Claude Code 配置：从环境变量生成 settings.json（worker）；缺失的变量写空串
 if [ "$role" = "worker" ]; then
+  claude_base_url="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+  claude_auth_token="${ANTHROPIC_AUTH_TOKEN:-}"
+
+  # 上游是 OpenAI 协议时，Claude Code 改连容器内的 cc-switch，由它转成
+  # Chat Completions；真实上游地址与 token 只交给 cc-switch。
+  # 转换器起不来时仍启动 daemon，便于进容器排查（与安装失败的处理一致）。
+  api_format="${LLM4AD_UPSTREAM_API_FORMAT:-anthropic}"
+  if [ "$api_format" = "openai_chat" ]; then
+    adapter_port="${LLM4AD_PROTOCOL_PROXY_PORT:-17821}"
+    if gosu paseo /usr/local/bin/arl-protocol-adapter configure; then
+      gosu paseo /usr/local/bin/arl-protocol-adapter serve &
+      gosu paseo /usr/local/bin/arl-protocol-adapter wait \
+        || echo "Protocol adapter is not ready; Claude Code requests will fail." >&2
+    else
+      echo "Protocol adapter configuration failed; Claude Code requests will fail." >&2
+    fi
+    claude_base_url="http://127.0.0.1:${adapter_port}"
+    claude_auth_token="llm4ad-local-proxy"
+  elif [ "$api_format" != "anthropic" ]; then
+    echo "Unsupported LLM4AD_UPSTREAM_API_FORMAT '$api_format'; using Anthropic directly." >&2
+  fi
+
   mkdir -p /home/paseo/.claude
   cat > /home/paseo/.claude/settings.json <<EOF
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}",
-    "ANTHROPIC_AUTH_TOKEN": "${ANTHROPIC_AUTH_TOKEN:-}",
+    "ANTHROPIC_BASE_URL": "${claude_base_url}",
+    "ANTHROPIC_AUTH_TOKEN": "${claude_auth_token}",
     "ANTHROPIC_MODEL": "${ANTHROPIC_MODEL:-claude-opus-5}",
     "ANTHROPIC_SMALL_FAST_MODEL": "${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4-5-20251001}"
   },
